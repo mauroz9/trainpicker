@@ -14,7 +14,7 @@ from telegram.ext import (
 
 # Importamos nuestro scraper y la base de datos
 from scraper import get_trains
-from database import add_alert, init_db, get_user_alerts
+from database import add_alert, delete_alert, init_db, get_user_alerts, cancel_alert
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -33,6 +33,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔹 /buscar - Inicia una nueva búsqueda de trenes paso a paso.\n"
         "🔹 /listar - Muestra las alertas de trenes que tienes activas en este momento.\n"
         "🔹 /cancelar - Detiene la búsqueda actual si te has equivocado al meter un dato.\n"
+        "🔹 /anular - Anula la alerta pulsando sobre ella.\n"
         "🔹 /info - Muestra este mensaje de ayuda.\n\n"
         "💡 *¿Cómo crear una alerta?*\n"
         "Usa /buscar. Si el tren que quieres aparece como '❌ COMPLETO', verás un botón debajo del mensaje para crear la alerta. ¡Púlsalo y yo me encargo del resto!"
@@ -145,6 +146,10 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 {fecha} | 🕒 {hora_tren} - {llegada_real}"
         )
         await query.edit_message_text(text=texto_confirmacion)
+    elif datos.startswith("borrar_"):
+        alert_id = datos.split("_")[1]
+        delete_alert(alert_id)
+        await query.edit_message_text(text="🗑️ Alerta eliminada correctamente.")
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operación cancelada. Escribe /buscar cuando quieras volver a intentarlo.")
@@ -172,6 +177,7 @@ def main():
     application.add_handler(CallbackQueryHandler(manejar_boton))
     application.add_handler(CommandHandler('listar', listar_alertas))
     application.add_handler(CommandHandler('info', info_command))
+    application.add_handler(CommandHandler('anular', cancel_alert))
     application.add_handler(conv_handler)
 
 
