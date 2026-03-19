@@ -10,6 +10,8 @@ from telegram import Bot
 from scraper import get_trains
 from database import get_active_alerts, delete_alert, init_db
 
+from datetime import datetime
+
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -87,8 +89,31 @@ async def check_alerts():
     alerts = get_active_alerts()
     if not alerts:
         return
+    
+    now = datetime.now()
+    valid_alerts = []
 
-    grouped_searches = _group_alerts(alerts)
+    for alert in alerts:
+        alert_id, user_id, origin, destination, date_str, train_time, arrival_time = alert
+        try:
+            date_time_str = f"{date_str} {train_time}"
+            date_time_train = datetime.strptime(date_time_str, "%d/%m/%Y %H:%M")
+
+            if now > date_time_train:
+                logger.info("🗑️ Eliminando alerta caducada %s: %s -> %s a las %s", alert_id, origin, destination, train_time)
+                delete_alert(alert_id)
+            else:
+                valid_alerts.append(alert)
+
+        except Exception as e:
+            logger.error("Error al comprobar la caducidad de la alerta %s: %s", alert_id, e)
+            valid_alerts.append(alert)
+
+    if not valid_alerts:
+        logger.info("Todas las alertas estaban caducadas. Fin de revisión.")
+        return
+    
+    grouped_searches = _group_alerts(valid_alerts)
 
     async with Bot(token=TOKEN) as bot:
         for (origin, destination, date), users_waiting in grouped_searches.items():
