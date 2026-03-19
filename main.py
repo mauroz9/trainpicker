@@ -1,6 +1,7 @@
 import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -100,20 +101,64 @@ async def recibir_destino(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FECHA
 
 async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fecha = update.message.text
-    context.user_data['fecha'] = fecha 
+    fecha_str = update.message.text
+    
+    try:
+        fecha_obj = datetime.strptime(fecha_str, "%d/%m/%Y")
+        hoy = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if fecha_obj < hoy:
+            await update.message.reply_text(
+                "❌ *Error:* La fecha introducida ya ha pasado.\n"
+                "Búsqueda cancelada. Escribe /buscar para volver a empezar.", 
+                parse_mode='Markdown'
+            )
+            return ConversationHandler.END
+            
+    except ValueError:
+        await update.message.reply_text(
+            "❌ *Error:* Formato de fecha incorrecto.\n"
+            "Debes usar el formato DD/MM/AAAA (ej: 25/04/2026).\n"
+            "Búsqueda cancelada. Escribe /buscar para volver a empezar.", 
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+
+    context.user_data['fecha'] = fecha_str 
     origen = context.user_data['origen']
     destino = context.user_data['destino']
     
-    await update.message.reply_text("⏳ Buscando trenes en Renfe...")
-    trenes = await get_trains(origen, destino, fecha)
+    await update.message.reply_text("⏳ Consultando trenes...")
+    
+    try:
+        trenes = await get_trains(origen, destino, fecha_str)
+    except Exception as e:
+        logger.error("Error crítico al buscar trenes: %s", e)
+        await update.message.reply_text("❌ Ha ocurrido un problema de conexión con Renfe. Inténtalo de nuevo en unos minutos.")
+        return ConversationHandler.END
 
     if not trenes:
-        await update.message.reply_text("❌ No se han encontrado trenes.")
+        dias_diferencia = (fecha_obj - hoy).days
+        
+        if dias_diferencia > 60:
+            mensaje_error = (
+                "❌ *No se han encontrado trenes.*\n\n"
+                "💡 *Consejo:* Estás buscando un tren para dentro de más de 2 meses. "
+                "Renfe suele publicar los billetes con 30-60 días de antelación. "
+                "Es muy probable que aún no estén a la venta. ¡Vuelve a intentarlo en unas semanas!"
+            )
+        else:
+            mensaje_error = (
+                "❌ *No se han encontrado trenes.*\n\n"
+                "Revisa que los nombres de las estaciones sean correctos (ej: 'Madrid' o 'Sevilla') "
+                "o es posible que no haya trenes directos para ese día."
+            )
+            
+        await update.message.reply_text(mensaje_error, parse_mode='Markdown')
         return ConversationHandler.END
 
     context.user_data['trenes_encontrados'] = trenes
-    mensaje_respuesta, reply_markup = _build_trains_message(fecha, trenes)
+    mensaje_respuesta, reply_markup = _build_trains_message(fecha_str, trenes)
     await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup, parse_mode='Markdown')
     return ConversationHandler.END
 
