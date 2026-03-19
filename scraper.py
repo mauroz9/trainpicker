@@ -1,75 +1,169 @@
 import asyncio
+import httpx
 from playwright.async_api import async_playwright
 import re
 
-async def get_trains(origin: str, destination: str, date_str: str):
-    """
-    Navega a Renfe y extrae los trenes disponibles para una fecha y ruta.
-    date_str debe tener el formato DD/MM/AAAA.
-    """
-    trains_found = []
+# Diccionario global para guardar las credenciales robadas
+API_TOKENS = {}
 
+def parsear_dwr_renfe(texto_dwr, date_str):
+    """
+    Parsea la respuesta DWR de Renfe.
+    Aplica la triple regla de disponibilidad: tarifas nulas, solo plazas H, o bloqueo tipo 3.
+    """
+    trenes_unicos = {}
+    
+    try:
+        # Convertir la fecha DD/MM/AAAA al formato interno de Renfe YYYY-MM-DD
+        d, m, y = date_str.split('/')
+        target_date = f"{y}-{m}-{d}"
+        
+        # Dividir el texto en bloques por cada tren
+        bloques = texto_dwr.split('acercamientoViajeDestino:')
+        
+        for bloque in bloques[1:]:
+            # Filtro 1: Asegurarnos de que es el día correcto (ignora trenes de Vuelta)
+            fecha_m = re.search(r'fecha:\s*"([^"]+)"', bloque)
+            if not fecha_m or fecha_m.group(1) != target_date:
+                continue 
+                
+            salida_m = re.search(r'horaSalida:\s*"(\d{2}:\d{2})"', bloque)
+            llegada_m = re.search(r'horaLlegada:\s*"(\d{2}:\d{2})"', bloque)
+            
+            # Buscamos las 3 variables clave
+            tarifas_m = re.search(r'tarifasDisponibles:\s*(null|\[)', bloque)
+            solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
+            razon_m = re.search(r'razonNoDisponible:\s*(null|"[^"]*")', bloque)
+            
+            if salida_m and llegada_m:
+                salida = salida_m.group(1)
+                llegada = llegada_m.group(1)
+                
+                # Asumimos que el tren tiene plazas libres
+                is_full = False 
+                
+                # REGLA 1: Si no hay tarifas, está completo
+                if tarifas_m and tarifas_m.group(1) == 'null':
+                    is_full = True
+                    
+                # REGLA 2: Si solo quedan plazas para movilidad reducida, está completo
+                if solo_plazah_m and solo_plazah_m.group(1) == 'true':
+                    is_full = True
+                    
+                # REGLA 3: Si tiene el bloqueo interno "3" de Renfe, está completo
+                if razon_m:
+                    razon = razon_m.group(1)
+                    if razon == '"3"':
+                        is_full = True
+                    
+                # Lógica anti-duplicados (Si un tren sale 2 veces y en una tarifa sí hay hueco, prima el hueco)
+                if salida not in trenes_unicos:
+                    trenes_unicos[salida] = {
+                        "salida": salida,
+                        "llegada": llegada,
+                        "disponible": not is_full
+                    }
+                else:
+                    if not is_full:
+                        trenes_unicos[salida]["disponible"] = True
+
+        # Convertir a lista y ordenar cronológicamente
+        trains_found = list(trenes_unicos.values())
+        trains_found = sorted(trains_found, key=lambda x: x['salida'])
+        
+        return trains_found
+
+    except Exception as e:
+        print(f"❌ Error parseando el DWR: {e}")
+        return []
+
+
+async def get_trains(origin: str, destination: str, date_str: str):
+    global API_TOKENS
+    search_key = f"{origin}-{destination}-{date_str}"
+
+    # ==========================================
+    # FASE 1: ATAQUE DIRECTO API (MILISEGUNDOS)
+    # ==========================================
+    if search_key in API_TOKENS:
+        print(f"⚡ Sesión activa para {search_key}. Atacando API directa...")
+        try:
+            session = API_TOKENS[search_key]
+
+            payload = session['post_data']
+            if isinstance(payload, str):
+                payload = payload.encode('utf-8')
+
+            clean_headers = {}
+            for k, v in session['headers'].items():
+                clean_headers[k] = v.encode('ascii', 'ignore').decode('ascii')
+                
+            async with httpx.AsyncClient() as client:
+                if session['method'] == 'POST':
+                    res = await client.post(session['url'], headers=clean_headers, content=payload, timeout=10.0)
+                else:
+                    res = await client.get(session['url'], headers=clean_headers, timeout=10.0)
+                
+                # Al ser DWR, Renfe devuelve código 200 y el texto "handleCallback" si funciona
+                if res.status_code == 200 and "handleCallback" in res.text:
+                    print("✅ ¡Respuesta API directa exitosa!")
+                    return parsear_dwr_renfe(res.text, date_str)
+                else:
+                    print(f"⚠️ Sesión caducada (HTTP {res.status_code}). Renovando token...")
+                    del API_TOKENS[search_key] 
+        except Exception as e:
+            print(f"❌ Error en llamada API directa: {e}")
+            if search_key in API_TOKENS:
+                del API_TOKENS[search_key]
+
+    # ==========================================
+    # FASE 2: ROBAR CREDENCIALES (PLAYWRIGHT)
+    # ==========================================
+    print("🕵️‍♂️ Iniciando Playwright para robar la sesión de Renfe...")
+    
     async with async_playwright() as p:
-        # Lanzamos el navegador (headless=True para que no abra ventana visual)
         browser = await p.chromium.launch(headless=True)
-        # Usamos un user-agent real para evitar bloqueos básicos
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
+        # Bloqueamos imágenes, CSS y media para ir más rápido
+        await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ["document", "script", "xhr", "fetch"] else route.abort())
+
         try:
             print(f"Buscando trenes: {origin} -> {destination} el {date_str}...")
             await page.goto("https://www.renfe.com/es/es", timeout=60000)
 
-            # 1. Aceptar cookies
             try:
                 await page.click("button#onetrust-accept-btn-handler", timeout=5000)
                 await page.wait_for_timeout(500)
             except:
                 pass 
 
-            # 2. Rellenar y SELECCIONAR Origen (Modo Teclado)
-            print(f"Escribiendo ORIGEN: {origin}")
             await page.click("input#origin")
             await page.wait_for_timeout(200)
-            # Borramos por si había algo escrito
             await page.fill("input#origin", "") 
             await page.locator("input#origin").press_sequentially(origin, delay=150)
-            
-            # Damos 2 segundos para que Renfe piense y despliegue la lista
             await page.wait_for_timeout(2000) 
-            
-            # Pulsamos Flecha Abajo para marcar el primer resultado y Enter para elegirlo
             await page.keyboard.press("ArrowDown")
             await page.wait_for_timeout(200)
             await page.keyboard.press("Enter")
-            print("ORIGEN seleccionado con éxito.")
-            
             await page.wait_for_timeout(800)
 
-            # 3. Rellenar y SELECCIONAR Destino (Modo Teclado)
-            print(f"Escribiendo DESTINO: {destination}")
             await page.click("input#destination")
             await page.wait_for_timeout(200)
             await page.fill("input#destination", "")
             await page.locator("input#destination").press_sequentially(destination, delay=150)
-            
             await page.wait_for_timeout(2000)
-            
             await page.keyboard.press("ArrowDown")
             await page.wait_for_timeout(200)
             await page.keyboard.press("Enter")
-            print("DESTINO seleccionado con éxito.")
-
             await page.wait_for_timeout(500)
 
-            # 4. Forzar "Viaje solo ida" para evitar comportamientos inconsistentes
             try:
                 await page.click("label[for='trip-go']", timeout=5000)
-                print("Marcado solo ida")
             except:
-                # Fallback robusto: muchos radios están ocultos, lo marcamos por JS.
                 await page.evaluate(
                     """
                     () => {
@@ -82,19 +176,15 @@ async def get_trains(origin: str, destination: str, date_str: str):
                     }
                     """
                 )
-
             await page.wait_for_timeout(300)
 
-            # 5. Rellenar fecha de ida actualizando también campos internos/ocultos
             fecha_asignada = await page.evaluate(
                 """
                 (value) => {
                     const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value || '');
                     if (!m) return { ok: false, reason: 'Formato de fecha inválido' };
 
-                    const dd = m[1];
-                    const mm = m[2];
-                    const yyyy = m[3];
+                    const dd = m[1]; const mm = m[2]; const yyyy = m[3];
                     const iso = `${yyyy}-${mm}-${dd}`;
                     const compact = `${yyyy}${mm}${dd}`;
 
@@ -102,19 +192,12 @@ async def get_trains(origin: str, destination: str, date_str: str):
 
                     const isDepartureField = (el) => {
                         const bag = [
-                            el.id || '',
-                            el.name || '',
-                            el.className || '',
-                            el.getAttribute('aria-label') || '',
-                            el.getAttribute('placeholder') || '',
+                            el.id || '', el.name || '', el.className || '',
+                            el.getAttribute('aria-label') || '', el.getAttribute('placeholder') || '',
                             el.getAttribute('title') || '',
-                        ]
-                            .join(' ')
-                            .toLowerCase();
-
+                        ].join(' ').toLowerCase();
                         const depKeys = ['first-input', 'ida', 'departure', 'salida', 'outbound', 'going', 'dategone'];
                         const retKeys = ['second-input', 'vuelta', 'return', 'round'];
-
                         return containsAny(bag, depKeys) && !containsAny(bag, retKeys);
                     };
 
@@ -149,25 +232,14 @@ async def get_trains(origin: str, destination: str, date_str: str):
                             input.removeAttribute('readonly');
                             input.value = nextValue;
                             input.setAttribute('value', nextValue);
-
-                            // Algunos formularios leen también formatos alternativos
-                            if (input.dataset) {
-                                input.dataset.date = value;
-                                input.dataset.isoDate = iso;
-                                input.dataset.compactDate = compact;
-                            }
-
                             input.dispatchEvent(new Event('input', { bubbles: true }));
                             input.dispatchEvent(new Event('change', { bubbles: true }));
                             input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
                             input.dispatchEvent(new Event('blur', { bubbles: true }));
                             updated += 1;
-                        } catch (_) {
-                            // Ignoramos inputs que no puedan editarse
-                        }
+                        } catch (_) {}
                     }
 
-                    // También sincronizamos posibles hidden de ida
                     for (const root of allRoots) {
                         const hiddenInputs = Array.from(root.querySelectorAll('input[type="hidden"]'));
                         for (const hidden of hiddenInputs) {
@@ -194,96 +266,35 @@ async def get_trains(origin: str, destination: str, date_str: str):
             if not fecha_asignada.get("ok"):
                 raise Exception("No se pudo aplicar la fecha de ida en el formulario")
 
-            # 6. Click en Buscar billete
-            print("Haciendo clic en 'Buscar billete'...")
-            search_button = "button[title='Buscar billete']"
-            await page.wait_for_selector(search_button, state="visible", timeout=10000)
-            await page.click(search_button)
+            print("Haciendo clic en 'Buscar billete' e interceptando la red DWR...")
+            url_keyword = "getTrainsList.dwr" 
 
-            # 7. Esperar a que cargue la tabla de resultados
-            # Renfe puede usar selectedTren o selectedTrain según versión
-            await page.wait_for_selector("div.selectedTren, div.selectedTrain", timeout=25000)
-            print("Tabla de trenes cargada con éxito.")
+            # === LA TRAMPA: INTERCEPTAMOS AQUÍ ===
+            async with page.expect_response(lambda response: url_keyword in response.url and response.status == 200, timeout=30000) as response_info:
+                search_button = "button[title='Buscar billete']"
+                await page.wait_for_selector(search_button, state="visible", timeout=10000)
+                await page.click(search_button)
+
+            # ¡Lo atrapamos! Leemos como TEXTO
+            api_response = await response_info.value
+            texto_dwr = await api_response.text()
             
-            # 8. Extraer la información ignorando resultados ocultos (display:none)
-            rows = page.locator("div.selectedTren, div.selectedTrain")
-            rows_count = await rows.count()
-            trenes_unicos = {}
+            api_request = api_response.request
+            API_TOKENS[search_key] = {
+                "url": api_request.url,
+                "method": api_request.method,
+                "headers": await api_request.all_headers(),
+                "post_data": api_request.post_data
+            }
+            print("🔐 ¡Cabeceras, Cookies y Tokens de Renfe cacheados con éxito!")
 
-            # Regex para buscar el formato HH:MM
-            patron_hora = re.compile(r'\d{2}:\d{2}')
-
-            for i in range(rows_count):
-                row = rows.nth(i)
-
-                # Ignoramos filas ocultas (display:none o invisibles)
-                if not await row.is_visible():
-                    continue
-
-                # --- 1. EXTRAER HORAS (div.trenes) ---
-                div_horas = row.locator("div.trenes")
-                if await div_horas.count() == 0:
-                    continue
-                    
-                texto_horas = await div_horas.first.inner_text()
-                horas_encontradas = patron_hora.findall(texto_horas)
-                
-                if len(horas_encontradas) >= 2:
-                    salida = horas_encontradas[0]
-                    llegada = horas_encontradas[-1]
-                else:
-                    continue
-
-                # --- 2. EXTRAER ESTADO basándonos en el bloque de precio ---
-                # Disponible: existe span.precio-final
-                # Completo: aparece botón/mensaje de "Tren Completo"
-                div_precio = row.locator("div[id^='precio-viaje']")
-                is_full = True  # Fallback conservador
-
-                if await div_precio.count() > 0:
-                    bloque_precio = div_precio.first
-
-                    tiene_precio = await bloque_precio.locator("span.precio-final").count() > 0
-                    if tiene_precio:
-                        is_full = False
-
-                    tiene_boton_completo = await bloque_precio.locator(
-                        "button:has-text('Tren Completo'), [title*='Tren Completo'], [title*='Completo']"
-                    ).count() > 0
-                    if tiene_boton_completo:
-                        is_full = True
-
-                    if not tiene_precio and not tiene_boton_completo:
-                        texto_bruto = await bloque_precio.inner_text()
-                        texto_limpio = re.sub(r'\s+', ' ', texto_bruto if texto_bruto else "").upper()
-                        if "COMPLETO" in texto_limpio or "SOLO PLAZA H" in texto_limpio or "NO DISPONIBLE" in texto_limpio:
-                            is_full = True
-                        elif "€" in texto_limpio:
-                            is_full = False
-
-                # --- 3. LÓGICA ANTI-DUPLICADOS ---
-                # Renfe pone varias filas iguales si hay diferentes tarifas (Básico, Elige...)
-                if salida not in trenes_unicos:
-                    trenes_unicos[salida] = {
-                        "salida": salida,
-                        "llegada": llegada,
-                        "disponible": not is_full
-                    }
-                else:
-                    # Si ya habíamos guardado este tren a esta hora y estaba lleno, 
-                    # pero esta nueva tarifa SÍ tiene billete, lo actualizamos a Disponible.
-                    if not is_full:
-                        trenes_unicos[salida]["disponible"] = True
-
-            # Convertimos nuestro diccionario a la lista que espera Telegram y la ordenamos por hora
-            trains_found = list(trenes_unicos.values())
-            trains_found = sorted(trains_found, key=lambda x: x['salida'])
+            return parsear_dwr_renfe(texto_dwr, date_str)
 
         except Exception as e:
-            print(f"Error durante el scraping: {e}")
+            print(f"❌ Error durante el robo de sesión DWR: {e}")
             await page.screenshot(path="error_renfe.png", full_page=True)
-            print("Captura de pantalla de error guardada en la raíz del proyecto.")
-        finally:
-            await browser.close()
+            return []
             
-    return trains_found
+        finally:
+            if 'browser' in locals():
+                await browser.close()
