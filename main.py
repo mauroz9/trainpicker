@@ -14,7 +14,7 @@ from telegram.ext import (
 
 # Importamos nuestro scraper y la base de datos
 from scraper import get_trains
-from database import add_alert, delete_alert, init_db, get_user_alerts, cancel_alert
+from database import add_alert, delete_alert, init_db, get_user_alerts
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -115,6 +115,25 @@ async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
+async def cancel_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    alertas = get_user_alerts(user_id)
+    
+    if not alertas:
+        await update.message.reply_text("📭 No tienes alertas activas para anular.")
+        return
+
+    await update.message.reply_text("🗑️ **Selecciona la alerta que quieres anular:**")
+    
+    for alerta in alertas:
+        alert_id, origin, destination, date, train_time, arrival_time, _ = alerta
+        
+        keyboard = [[InlineKeyboardButton(f"❌ Anular alerta", callback_data=f"borrar_{alert_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        mensaje = f"🛤️ {origin} ➡️ {destination}\n📅 {date} | 🕒 {train_time}"
+        await update.message.reply_text(mensaje, reply_markup=reply_markup)
+
 async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer() 
@@ -148,10 +167,14 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=texto_confirmacion)
     elif datos.startswith("borrar_"):
         alert_id = datos.split("_")[1]
-        delete_alert(alert_id)
-        await query.edit_message_text(text="🗑️ Alerta eliminada correctamente.")
+        try:
+            delete_alert(alert_id)
+            await query.edit_message_text(text="🗑️ La alerta ha sido anulada correctamente.")
+        except Exception as e:
+            logging.error(f"Error al borrar alerta: {e}")
+            await query.edit_message_text(text="⚠️ No se pudo anular la alerta. Inténtalo de nuevo.")
 
-async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancelar(update: Update):
     await update.message.reply_text("Operación cancelada. Escribe /buscar cuando quieras volver a intentarlo.")
     return ConversationHandler.END
 
@@ -160,7 +183,7 @@ def main():
         print("Error: No hay token configurado.")
         return
 
-    init_db() # Nos aseguramos de que la base de datos exista al arrancar
+    init_db()
     application = ApplicationBuilder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(

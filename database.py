@@ -69,25 +69,5 @@ def delete_alert(alert_id):
     conn.commit()
     conn.close()
 
-async def cancel_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    alertas = get_user_alerts(user_id)
-    
-    if not alertas:
-        await update.message.reply_text("📭 No tienes alertas activas para cancelar.")
-        return
-
-    await update.message.reply_text("🗑️ **Selecciona la alerta que quieres eliminar:**")
-    
-    for alerta in alertas:
-        alert_id, origin, destination, date, train_time, arrival_time, is_active = alerta
-        
-        texto_boton = f"❌ Borrar {train_time} ({origin} -> {destination})"
-        keyboard = [[InlineKeyboardButton(texto_boton, callback_data=f"borrar_{alert_id}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        mensaje = f"📅 {date} | 🕒 {train_time} - {arrival_time}"
-        await update.message.reply_text(mensaje, reply_markup=reply_markup)
-
 if __name__ == "__main__":
     init_db()
