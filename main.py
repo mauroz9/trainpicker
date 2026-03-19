@@ -172,8 +172,8 @@ async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mensaje = "📋 *Tus Alertas:*\n\n"
     for alerta in alertas:
-        _, origin, destination, date, train_time, arrival_time, is_active = alerta
-        estado = "✅ Buscando..." if is_active else "❌ Inactiva"
+        _, origin, destination, date, train_time, arrival_time, _ = alerta
+        estado = "✅ Buscando..."
         
         mensaje += f"🔹 *{origin} ➡️ {destination}*\n"
         mensaje += f"   📅 {date} | 🕒 {train_time} - {arrival_time} | {estado}\n\n"

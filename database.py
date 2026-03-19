@@ -64,7 +64,12 @@ def deactivate_alert(alert_id):
 def get_user_alerts(user_id) -> List[UserAlert]:
     with _get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT id, origin, destination, date, train_time, arrival_time, is_active FROM alerts WHERE user_id = ?', (user_id,))
+        cursor.execute('''
+            SELECT id, origin, destination, date, train_time, arrival_time, is_active 
+            FROM alerts 
+            WHERE user_id = ? 
+            ORDER BY substr(date, 7, 4) || substr(date, 4, 2) || substr(date, 1, 2) ASC, train_time ASC
+        ''', (user_id,))
         alerts = cursor.fetchall()
     return alerts
 
