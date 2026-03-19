@@ -1,5 +1,7 @@
 import os
 import logging
+from typing import Any, Dict, List, Optional, Tuple
+
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,10 +11,9 @@ from telegram.ext import (
     filters, 
     ContextTypes, 
     ConversationHandler,
-    CallbackQueryHandler # Añadido para escuchar los botones
+    CallbackQueryHandler
 )
 
-# Importamos nuestro scraper y la base de datos
 from scraper import get_trains
 from database import add_alert, delete_alert, init_db, get_user_alerts
 
@@ -20,8 +21,36 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 ORIGEN, DESTINO, FECHA = range(3)
+
+
+def _build_trains_message(fecha: str, trenes: List[Dict[str, Any]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    origen_real = trenes[0]['origen']
+    destino_real = trenes[0]['destino']
+    mensaje_respuesta = f"🚆 **Trenes {origen_real} ➡️ {destino_real} el {fecha}**\n\n"
+
+    keyboard = []
+    for tren in trenes:
+        if tren['disponible']:
+            estado = "✅ DISPONIBLE"
+        else:
+            estado = "❌ COMPLETO"
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"🔔 Avisar: {tren['salida']} a {tren['llegada']}",
+                    callback_data=f"alerta_{tren['salida']}"
+                )
+            ])
+        mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
+
+    return mensaje_respuesta, InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
+def _get_selected_train(context_data: Dict[str, Any], hora_tren: str) -> Optional[Dict[str, Any]]:
+    trenes = context_data.get('trenes_encontrados', [])
+    return next((tren for tren in trenes if tren['salida'] == hora_tren), None)
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra la información del bot y los comandos disponibles."""
@@ -83,29 +112,8 @@ async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ No se han encontrado trenes.")
         return ConversationHandler.END
 
-    # GUARDAMOS LOS TRENES EN MEMORIA PARA CUANDO EL USUARIO PULSE EL BOTÓN
     context.user_data['trenes_encontrados'] = trenes
-
-    origen_real = trenes[0]['origen']
-    destino_real = trenes[0]['destino']
-
-    mensaje_respuesta = f"🚆 **Trenes {origen_real} ➡️ {destino_real} el {fecha}**\n\n"
-    keyboard = []
-
-    for tren in trenes:
-        if tren['disponible']:
-            estado = "✅ DISPONIBLE"
-        else:
-            estado = "❌ COMPLETO"
-            boton = InlineKeyboardButton(
-                text=f"🔔 Avisar: {tren['salida']} a {tren['llegada']}", 
-                callback_data=f"alerta_{tren['salida']}"
-            )
-            keyboard.append([boton])
-
-        mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
-
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    mensaje_respuesta, reply_markup = _build_trains_message(fecha, trenes)
     await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup)
     return ConversationHandler.END
 
@@ -119,11 +127,11 @@ async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mensaje = "📋 *Tus Alertas:*\n\n"
     for alerta in alertas:
-        alert_id, origin, destination, date, train_time, arrival_time, is_active = alerta
+        _, origin, destination, date, train_time, arrival_time, is_active = alerta
         estado = "✅ Buscando..." if is_active else "❌ Inactiva"
         
         mensaje += f"🔹 *{origin} ➡️ {destination}*\n"
-        mensaje += f"   📅 {date} | 🕒 {train_time} - {arrival_time}\n\n"
+        mensaje += f"   📅 {date} | 🕒 {train_time} - {arrival_time} | {estado}\n\n"
 
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
@@ -156,8 +164,7 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         fecha = context.user_data.get('fecha')
         
-        # RECUPERAMOS LOS DATOS OFICIALES DEL TREN ELEGIDO
-        tren_elegido = next((t for t in context.user_data.get('trenes_encontrados', []) if t['salida'] == hora_tren), None)
+        tren_elegido = _get_selected_train(context.user_data, hora_tren)
         
         if not tren_elegido:
             await query.edit_message_text(text="⚠️ Sesión expirada. Vuelve a usar /buscar.")
@@ -167,7 +174,6 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         destino_real = tren_elegido['destino']
         llegada_real = tren_elegido['llegada']
         
-        # Lo guardamos en la base de datos con los nombres oficiales
         add_alert(user_id, origen_real, destino_real, fecha, hora_tren, llegada_real)
         
         texto_confirmacion = (
@@ -183,11 +189,11 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delete_alert(alert_id)
             await query.edit_message_text(text="🗑️ La alerta ha sido anulada correctamente.")
         except Exception as e:
-            logging.error(f"Error al borrar alerta: {e}")
+            logger.error("Error al borrar alerta: %s", e)
             await query.edit_message_text(text="⚠️ No se pudo anular la alerta. Inténtalo de nuevo.")
 
-async def cancelar(update: Update):
-    await update.message.reply_text("Operación cancelada. Escribe /buscar cuando quieras volver a intentarlo.")
+async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Busqueda cancelada. Escribe /buscar cuando quieras volver a intentarlo.")
     return ConversationHandler.END
 
 def main():

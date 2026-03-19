@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+from typing import Dict, List, Tuple
+
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
@@ -17,6 +19,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+GroupedAlerts = Dict[Tuple[str, str, str], List[dict]]
+
+
+def _group_alerts(alerts) -> GroupedAlerts:
+    grouped_searches: GroupedAlerts = {}
+    for alert in alerts:
+        alert_id, user_id, origin, destination, date, train_time, arrival_time = alert
+        key = (origin, destination, date)
+        grouped_searches.setdefault(key, []).append({
+            "alert_id": alert_id,
+            "user_id": user_id,
+            "train_time": train_time,
+            "arrival_time": arrival_time,
+        })
+    return grouped_searches
+
+
+async def _notify_users_for_route(bot: Bot, origin: str, destination: str, date: str, users_waiting: List[dict]):
+    trenes = await get_trains(origin, destination, date)
+    if not trenes:
+        return
+
+    for tren_web in trenes:
+        if not tren_web.get('disponible'):
+            continue
+
+        for user_data in users_waiting:
+            if user_data['train_time'] != tren_web.get('salida'):
+                continue
+
+            mensaje = (
+                f"🚨 *¡PLAZA LIBRE DETECTADA!* 🚨\n\n"
+                f"🛤️ *Trayecto:* {origin} ➡️ {destination}\n"
+                f"📅 *Fecha:* {date}\n"
+                f"🕒 *Horario:* {user_data['train_time']} - {user_data['arrival_time']}\n\n"
+                f"👉 ¡Corre a la app de Renfe antes de que vuele!"
+            )
+
+            try:
+                await bot.send_message(
+                    chat_id=user_data['user_id'],
+                    text=mensaje,
+                    parse_mode='Markdown'
+                )
+                delete_alert(user_data['alert_id'])
+            except Exception as e:
+                logger.error("Error enviando mensaje: %s", e)
+
 async def check_alerts():
     logger.info("Iniciando revisión de alertas...")
 
@@ -24,43 +74,11 @@ async def check_alerts():
     if not alerts:
         return
 
-    grouped_searches = {}
-    for alert in alerts:
-        # Extraemos las 7 columnas, incluyendo arrival_time
-        alert_id, user_id, origin, destination, date, train_time, arrival_time = alert
-        key = (origin, destination, date)
-        grouped_searches.setdefault(key, []).append({
-            "alert_id": alert_id,
-            "user_id": user_id,
-            "train_time": train_time,
-            "arrival_time": arrival_time
-        })
+    grouped_searches = _group_alerts(alerts)
 
     async with Bot(token=TOKEN) as bot:
         for (origin, destination, date), users_waiting in grouped_searches.items():
-            trenes = await get_trains(origin, destination, date)
-            if not trenes: continue
-
-            for tren_web in trenes:
-                if tren_web.get('disponible'):
-                    for user_data in users_waiting:
-                        if user_data['train_time'] == tren_web.get('salida'):
-                            mensaje = (
-                                f"🚨 *¡PLAZA LIBRE DETECTADA!* 🚨\n\n"
-                                f"🛤️ *Trayecto:* {origin} ➡️ {destination}\n"
-                                f"📅 *Fecha:* {date}\n"
-                                f"🕒 *Horario:* {user_data['train_time']} - {user_data['arrival_time']}\n\n"
-                                f"👉 ¡Corre a la app de Renfe antes de que vuele!"
-                            )
-                            try:
-                                await bot.send_message(
-                                    chat_id=user_data['user_id'],
-                                    text=mensaje,
-                                    parse_mode='Markdown'
-                                )
-                                delete_alert(user_data['alert_id'])
-                            except Exception as e:
-                                logger.error(f"Error enviando mensaje: {e}")
+            await _notify_users_for_route(bot, origin, destination, date, users_waiting)
 
     logger.info("Revisión de alertas finalizada.")
 
@@ -79,7 +97,6 @@ async def main():
     scheduler.start()
 
     try:
-        # Mantener el proceso vivo dentro del loop async
         await asyncio.Event().wait()
     finally:
         scheduler.shutdown()

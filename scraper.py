@@ -1,30 +1,43 @@
 import codecs
+import logging
+import re
+from typing import Any, Dict, List, Optional
 
 import httpx
 from playwright.async_api import async_playwright
-import re
+
+logger = logging.getLogger(__name__)
+API_TOKENS: Dict[str, Dict[str, Any]] = {}
 
 
-# Diccionario global para guardar las credenciales robadas
-API_TOKENS = {}
+def _build_search_key(origin: str, destination: str, date_str: str) -> str:
+    return f"{origin}-{destination}-{date_str}"
+
+
+def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    return {
+        key: value.encode("ascii", "ignore").decode("ascii")
+        for key, value in headers.items()
+    }
+
+
+def _decode_escaped_text(value: str) -> str:
+    return codecs.decode(value, "unicode_escape").title()
 
 def parsear_dwr_renfe(texto_dwr, date_str):
     """
     Parsea la respuesta DWR de Renfe.
     Aplica la triple regla de disponibilidad: tarifas nulas, solo plazas H, o bloqueo tipo 3.
     """
-    trenes_unicos = {}
+    trenes_unicos: Dict[str, Dict[str, Any]] = {}
     
     try:
-        # Convertir la fecha DD/MM/AAAA al formato interno de Renfe YYYY-MM-DD
         d, m, y = date_str.split('/')
         target_date = f"{y}-{m}-{d}"
         
-        # Dividir el texto en bloques por cada tren
         bloques = texto_dwr.split('acercamientoViajeDestino:')
         
         for bloque in bloques[1:]:
-            # Filtro 1: Asegurarnos de que es el día correcto (ignora trenes de Vuelta)
             fecha_m = re.search(r'fecha:\s*"([^"]+)"', bloque)
             if not fecha_m or fecha_m.group(1) != target_date:
                 continue 
@@ -43,28 +56,22 @@ def parsear_dwr_renfe(texto_dwr, date_str):
                 salida = salida_m.group(1)
                 llegada = llegada_m.group(1)
 
-                # Descodificamos caracteres (ej: "MAR\u00CDA" -> "MARÍA")
-                origen_real = codecs.decode(origen_m.group(1), 'unicode_escape') if origen_m else ""
-                destino_real = codecs.decode(destino_m.group(1), 'unicode_escape') if destino_m else ""
+                origen_real = _decode_escaped_text(origen_m.group(1)) if origen_m else ""
+                destino_real = _decode_escaped_text(destino_m.group(1)) if destino_m else ""
                 
-                # Asumimos que el tren tiene plazas libres
                 is_full = False 
                 
-                # REGLA 1: Si no hay tarifas, está completo
                 if tarifas_m and tarifas_m.group(1) == 'null':
                     is_full = True
                     
-                # REGLA 2: Si solo quedan plazas para movilidad reducida, está completo
                 if solo_plazah_m and solo_plazah_m.group(1) == 'true':
                     is_full = True
                     
-                # REGLA 3: Si tiene el bloqueo interno "3" de Renfe, está completo
                 if razon_m:
                     razon = razon_m.group(1)
                     if razon == '"3"':
                         is_full = True
                     
-                # Lógica anti-duplicados (Si un tren sale 2 veces y en una tarifa sí hay hueco, prima el hueco)
                 if salida not in trenes_unicos:
                     trenes_unicos[salida] = {
                         "salida": salida,
@@ -77,60 +84,51 @@ def parsear_dwr_renfe(texto_dwr, date_str):
                     if not is_full:
                         trenes_unicos[salida]["disponible"] = True
 
-        # Convertir a lista y ordenar cronológicamente
         trains_found = list(trenes_unicos.values())
         trains_found = sorted(trains_found, key=lambda x: x['salida'])
         
         return trains_found
 
     except Exception as e:
-        print(f"❌ Error parseando el DWR: {e}")
+        logger.exception("Error parseando el DWR: %s", e)
         return []
 
 
-async def get_trains(origin: str, destination: str, date_str: str):
-    global API_TOKENS
-    search_key = f"{origin}-{destination}-{date_str}"
+async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional[List[Dict[str, Any]]]:
+    session = API_TOKENS[search_key]
+    payload = session["post_data"]
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
 
-    # ==========================================
-    # FASE 1: ATAQUE DIRECTO API (MILISEGUNDOS)
-    # ==========================================
-    if search_key in API_TOKENS:
-        print(f"⚡ Sesión activa para {search_key}. Atacando API directa...")
-        try:
-            session = API_TOKENS[search_key]
+    clean_headers = _sanitize_headers(session["headers"])
 
-            payload = session['post_data']
-            if isinstance(payload, str):
-                payload = payload.encode('utf-8')
+    async with httpx.AsyncClient() as client:
+        if session["method"] == "POST":
+            res = await client.post(
+                session["url"],
+                headers=clean_headers,
+                content=payload,
+                timeout=10.0,
+            )
+        else:
+            res = await client.get(session["url"], headers=clean_headers, timeout=10.0)
 
-            clean_headers = {}
-            for k, v in session['headers'].items():
-                clean_headers[k] = v.encode('ascii', 'ignore').decode('ascii')
-                
-            async with httpx.AsyncClient() as client:
-                if session['method'] == 'POST':
-                    res = await client.post(session['url'], headers=clean_headers, content=payload, timeout=10.0)
-                else:
-                    res = await client.get(session['url'], headers=clean_headers, timeout=10.0)
-                
-                # Al ser DWR, Renfe devuelve código 200 y el texto "handleCallback" si funciona
-                if res.status_code == 200 and "handleCallback" in res.text:
-                    print("✅ ¡Respuesta API directa exitosa!")
-                    return parsear_dwr_renfe(res.text, date_str)
-                else:
-                    print(f"⚠️ Sesión caducada (HTTP {res.status_code}). Renovando token...")
-                    del API_TOKENS[search_key] 
-        except Exception as e:
-            print(f"❌ Error en llamada API directa: {e}")
-            if search_key in API_TOKENS:
-                del API_TOKENS[search_key]
+    if res.status_code == 200 and "handleCallback" in res.text:
+        logger.info("Respuesta API directa exitosa")
+        return parsear_dwr_renfe(res.text, date_str)
 
-    # ==========================================
-    # FASE 2: ROBAR CREDENCIALES (PLAYWRIGHT)
-    # ==========================================
-    print("🕵️‍♂️ Iniciando Playwright para robar la sesión de Renfe...")
-    
+    logger.warning("Sesion caducada (HTTP %s). Renovando token", res.status_code)
+    return None
+
+
+async def _capture_session_with_playwright(
+    origin: str,
+    destination: str,
+    date_str: str,
+    search_key: str,
+) -> List[Dict[str, Any]]:
+    logger.info("Iniciando Playwright para capturar sesion de Renfe")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -138,11 +136,10 @@ async def get_trains(origin: str, destination: str, date_str: str):
         )
         page = await context.new_page()
 
-        # Bloqueamos imágenes, CSS y media para ir más rápido
         await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ["document", "script", "xhr", "fetch"] else route.abort())
 
         try:
-            print(f"Buscando trenes: {origin} -> {destination} el {date_str}...")
+            logger.info("Buscando trenes: %s -> %s el %s", origin, destination, date_str)
             await page.goto("https://www.renfe.com/es/es", timeout=60000)
 
             try:
@@ -276,16 +273,14 @@ async def get_trains(origin: str, destination: str, date_str: str):
             if not fecha_asignada.get("ok"):
                 raise Exception("No se pudo aplicar la fecha de ida en el formulario")
 
-            print("Haciendo clic en 'Buscar billete' e interceptando la red DWR...")
+            logger.info("Interceptando solicitud DWR de trenes")
             url_keyword = "getTrainsList.dwr" 
 
-            # === LA TRAMPA: INTERCEPTAMOS AQUÍ ===
             async with page.expect_response(lambda response: url_keyword in response.url and response.status == 200, timeout=30000) as response_info:
                 search_button = "button[title='Buscar billete']"
                 await page.wait_for_selector(search_button, state="visible", timeout=10000)
                 await page.click(search_button)
 
-            # ¡Lo atrapamos! Leemos como TEXTO
             api_response = await response_info.value
             texto_dwr = await api_response.text()
             
@@ -296,15 +291,33 @@ async def get_trains(origin: str, destination: str, date_str: str):
                 "headers": await api_request.all_headers(),
                 "post_data": api_request.post_data
             }
-            print("🔐 ¡Cabeceras, Cookies y Tokens de Renfe cacheados con éxito!")
+            logger.info("Sesion y tokens de Renfe cacheados con exito")
 
             return parsear_dwr_renfe(texto_dwr, date_str)
 
         except Exception as e:
-            print(f"❌ Error durante el robo de sesión DWR: {e}")
+            logger.exception("Error durante captura de sesion DWR: %s", e)
             await page.screenshot(path="error_renfe.png", full_page=True)
             return []
             
         finally:
             if 'browser' in locals():
                 await browser.close()
+
+
+async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
+    search_key = _build_search_key(origin, destination, date_str)
+
+    if search_key in API_TOKENS:
+        logger.info("Sesion activa para %s. Intentando API directa", search_key)
+        try:
+            cached_result = await _fetch_with_cached_session(search_key, date_str)
+            if cached_result is not None:
+                return cached_result
+            del API_TOKENS[search_key]
+        except Exception as e:
+            logger.exception("Error en llamada API directa: %s", e)
+            if search_key in API_TOKENS:
+                del API_TOKENS[search_key]
+
+    return await _capture_session_with_playwright(origin, destination, date_str, search_key)
