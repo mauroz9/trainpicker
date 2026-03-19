@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  telegram_bot:
+    build: .
+    container_name: renfe_bot_app
+    command: python main.py
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - renfe_database:/app/data
+
+  renfe_scheduler:
+    build: .
+    container_name: renfe_bot_scheduler
+    command: python scheduler.py
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - renfe_database:/app/data
+    depends_on:
+      - telegram_bot
+
+volumes:
+  renfe_database:
