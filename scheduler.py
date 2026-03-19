@@ -22,27 +22,24 @@ async def check_alerts():
 
     alerts = get_active_alerts()
     if not alerts:
-        logger.info("No hay alertas activas. Esperando al siguiente ciclo.")
         return
 
     grouped_searches = {}
     for alert in alerts:
-        alert_id, user_id, origin, destination, date, train_time = alert
+        # Extraemos las 7 columnas, incluyendo arrival_time
+        alert_id, user_id, origin, destination, date, train_time, arrival_time = alert
         key = (origin, destination, date)
         grouped_searches.setdefault(key, []).append({
             "alert_id": alert_id,
             "user_id": user_id,
-            "train_time": train_time
+            "train_time": train_time,
+            "arrival_time": arrival_time
         })
 
     async with Bot(token=TOKEN) as bot:
         for (origin, destination, date), users_waiting in grouped_searches.items():
-            logger.info(f"Scrapeando Renfe para {origin}-{destination} el {date}")
             trenes = await get_trains(origin, destination, date)
-
-            if not trenes:
-                logger.error(f"Fallo al obtener trenes para {origin}-{destination}.")
-                continue
+            if not trenes: continue
 
             for tren_web in trenes:
                 if tren_web.get('disponible'):
@@ -50,10 +47,10 @@ async def check_alerts():
                         if user_data['train_time'] == tren_web.get('salida'):
                             mensaje = (
                                 f"🚨 *¡PLAZA LIBRE DETECTADA!* 🚨\n\n"
-                                f"🛤️ Trayecto: {origin} - {destination}\n"
-                                f"📅 Fecha: {date}\n"
-                                f"🕒 Hora: {tren_web['salida']}\n\n"
-                                f"👉 ¡Corre a la web o app de Renfe para comprarlo antes de que vuele!"
+                                f"🛤️ *Trayecto:* {origin} ➡️ {destination}\n"
+                                f"📅 *Fecha:* {date}\n"
+                                f"🕒 *Horario:* {user_data['train_time']} - {user_data['arrival_time']}\n\n"
+                                f"👉 ¡Corre a la app de Renfe antes de que vuele!"
                             )
                             try:
                                 await bot.send_message(
@@ -61,10 +58,9 @@ async def check_alerts():
                                     text=mensaje,
                                     parse_mode='Markdown'
                                 )
-                                logger.info(f"Mensaje enviado con éxito al usuario {user_data['user_id']}")
                                 deactivate_alert(user_data['alert_id'])
                             except Exception as e:
-                                logger.error(f"Error enviando mensaje a {user_data['user_id']}: {e}")
+                                logger.error(f"Error enviando mensaje: {e}")
 
     logger.info("Revisión de alertas finalizada.")
 

@@ -1,7 +1,9 @@
-import asyncio
+import codecs
+
 import httpx
 from playwright.async_api import async_playwright
 import re
+
 
 # Diccionario global para guardar las credenciales robadas
 API_TOKENS = {}
@@ -29,8 +31,10 @@ def parsear_dwr_renfe(texto_dwr, date_str):
                 
             salida_m = re.search(r'horaSalida:\s*"(\d{2}:\d{2})"', bloque)
             llegada_m = re.search(r'horaLlegada:\s*"(\d{2}:\d{2})"', bloque)
+
+            origen_m = re.search(r'descripcionEstacionOrigen:\s*"([^"]+)"', bloque)
+            destino_m = re.search(r'descripcionEstacionDestino:\s*"([^"]+)"', bloque)
             
-            # Buscamos las 3 variables clave
             tarifas_m = re.search(r'tarifasDisponibles:\s*(null|\[)', bloque)
             solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
             razon_m = re.search(r'razonNoDisponible:\s*(null|"[^"]*")', bloque)
@@ -38,6 +42,10 @@ def parsear_dwr_renfe(texto_dwr, date_str):
             if salida_m and llegada_m:
                 salida = salida_m.group(1)
                 llegada = llegada_m.group(1)
+
+                # Descodificamos caracteres (ej: "MAR\u00CDA" -> "MARÍA")
+                origen_real = codecs.decode(origen_m.group(1), 'unicode_escape') if origen_m else ""
+                destino_real = codecs.decode(destino_m.group(1), 'unicode_escape') if destino_m else ""
                 
                 # Asumimos que el tren tiene plazas libres
                 is_full = False 
@@ -61,6 +69,8 @@ def parsear_dwr_renfe(texto_dwr, date_str):
                     trenes_unicos[salida] = {
                         "salida": salida,
                         "llegada": llegada,
+                        "origen": origen_real.title(),
+                        "destino": destino_real.title(),
                         "disponible": not is_full
                     }
                 else:

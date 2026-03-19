@@ -5,7 +5,6 @@ os.makedirs("data", exist_ok=True)
 DB_NAME = "data/renfe_alerts.db"
 
 def init_db():
-    """Crea la tabla de alertas si no existe."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -16,39 +15,36 @@ def init_db():
             destination TEXT NOT NULL,
             date TEXT NOT NULL,
             train_time TEXT NOT NULL,
+            arrival_time TEXT DEFAULT '',
             is_active BOOLEAN DEFAULT 1
         )
     ''')
+    try:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN arrival_time TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
-def add_alert(user_id, origin, destination, date, train_time):
-    """Añade una nueva alerta a la base de datos."""
+def add_alert(user_id, origin, destination, date, train_time, arrival_time):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO alerts (user_id, origin, destination, date, train_time)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, origin, destination, date, train_time))
+        INSERT INTO alerts (user_id, origin, destination, date, train_time, arrival_time)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, origin, destination, date, train_time, arrival_time))
     conn.commit()
     conn.close()
 
 def get_active_alerts():
-    """Devuelve todas las alertas que están activas."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Obtenemos id_alerta, usuario, origen, destino, fecha y hora del tren
-    cursor.execute('''
-        SELECT id, user_id, origin, destination, date, train_time 
-        FROM alerts 
-        WHERE is_active = 1
-    ''')
+    cursor.execute('SELECT id, user_id, origin, destination, date, train_time, arrival_time FROM alerts WHERE is_active = 1')
     alerts = cursor.fetchall()
     conn.close()
     return alerts
 
 def deactivate_alert(alert_id):
-    """Marca una alerta como inactiva para no volver a avisar."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('UPDATE alerts SET is_active = 0 WHERE id = ?', (alert_id,))
@@ -56,18 +52,12 @@ def deactivate_alert(alert_id):
     conn.close()
 
 def get_user_alerts(user_id):
-    """Devuelve todas las alertas de un usuario específico."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, origin, destination, date, train_time, is_active 
-        FROM alerts 
-        WHERE user_id = ?
-    ''', (user_id,))
+    cursor.execute('SELECT id, origin, destination, date, train_time, arrival_time, is_active FROM alerts WHERE user_id = ?', (user_id,))
     alerts = cursor.fetchall()
     conn.close()
     return alerts
 
 if __name__ == "__main__":
     init_db()
-    print("Base de datos inicializada correctamente.")

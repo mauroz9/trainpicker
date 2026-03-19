@@ -59,41 +59,40 @@ async def recibir_destino(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha = update.message.text
-    context.user_data['fecha'] = fecha # Guardamos la fecha en memoria
+    context.user_data['fecha'] = fecha 
     origen = context.user_data['origen']
     destino = context.user_data['destino']
     
-    await update.message.reply_text("⏳ Buscando trenes en Renfe... Esto puede tardar unos segundos.")
-
+    await update.message.reply_text("⏳ Buscando trenes en Renfe...")
     trenes = await get_trains(origen, destino, fecha)
 
     if not trenes:
-        await update.message.reply_text("❌ No se han encontrado trenes o hubo un error al leer la web de Renfe.")
+        await update.message.reply_text("❌ No se han encontrado trenes.")
         return ConversationHandler.END
 
-    mensaje_respuesta = f"🚆 **Trenes {origen} - {destino} el {fecha}**\n\n"
+    # GUARDAMOS LOS TRENES EN MEMORIA PARA CUANDO EL USUARIO PULSE EL BOTÓN
+    context.user_data['trenes_encontrados'] = trenes
+
+    origen_real = trenes[0]['origen']
+    destino_real = trenes[0]['destino']
+
+    mensaje_respuesta = f"🚆 **Trenes {origen_real} ➡️ {destino_real} el {fecha}**\n\n"
     keyboard = []
 
     for tren in trenes:
         if tren['disponible']:
             estado = "✅ DISPONIBLE"
-            mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
         else:
             estado = "❌ COMPLETO"
-            mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
-            
-            # Si está completo, creamos un botón para él. 
-            # El callback_data guarda la hora de salida para identificarlo luego.
             boton = InlineKeyboardButton(
-                text=f"🔔 Crear alerta: {tren['salida']}", 
+                text=f"🔔 Avisar: {tren['salida']} a {tren['llegada']}", 
                 callback_data=f"alerta_{tren['salida']}"
             )
-            keyboard.append([boton]) # Lo metemos como una fila nueva
+            keyboard.append([boton])
 
-    # Si hay botones (trenes llenos), creamos el panel (Markup)
+        mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
+
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    
-    # Enviamos el mensaje con los botones adjuntos
     await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup)
     return ConversationHandler.END
 
@@ -102,47 +101,48 @@ async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alertas = get_user_alerts(user_id)
     
     if not alertas:
-        await update.message.reply_text("📭 No tienes ninguna alerta configurada en este momento.")
+        await update.message.reply_text("📭 No tienes alertas configuradas.")
         return
 
-    mensaje = "📋 *Tus Alertas Configuradas:*\n\n"
+    mensaje = "📋 *Tus Alertas:*\n\n"
     for alerta in alertas:
-        alert_id, origin, destination, date, train_time, is_active = alerta
-        estado = "✅ Consultando..." if is_active else "❌ Inactiva / Ya avisada"
+        alert_id, origin, destination, date, train_time, arrival_time, is_active = alerta
+        estado = "✅ Buscando..." if is_active else "❌ Inactiva"
         
-        mensaje += f"🔹ID {alert_id}: *{origin} ➡️ {destination}* "
-        mensaje += f"   📅 {date} | 🕒 {train_time} | {estado}\n\n"
+        mensaje += f"🔹 *{origin} ➡️ {destination}*\n"
+        mensaje += f"   📅 {date} | 🕒 {train_time} - {arrival_time}\n\n"
 
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
 async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Esta función se activa cuando un usuario hace clic en un botón Inline."""
     query = update.callback_query
-    await query.answer() # Esto quita el icono de "cargando" en el botón del usuario
-    
-    datos = query.data # Aquí viene el "alerta_10:30"
+    await query.answer() 
+    datos = query.data 
     
     if datos.startswith("alerta_"):
         hora_tren = datos.split("_")[1]
         user_id = query.from_user.id
-        
-        # Recuperamos los datos de la memoria de la conversación
-        origen = context.user_data.get('origen')
-        destino = context.user_data.get('destino')
         fecha = context.user_data.get('fecha')
         
-        if not (origen and destino and fecha):
-            await query.edit_message_text(text="⚠️ La sesión expiró o faltan datos. Vuelve a usar /buscar.")
+        # RECUPERAMOS LOS DATOS OFICIALES DEL TREN ELEGIDO
+        tren_elegido = next((t for t in context.user_data.get('trenes_encontrados', []) if t['salida'] == hora_tren), None)
+        
+        if not tren_elegido:
+            await query.edit_message_text(text="⚠️ Sesión expirada. Vuelve a usar /buscar.")
             return
         
-        # Guardamos en la base de datos SQLite
-        add_alert(user_id, origen, destino, fecha, hora_tren)
+        origen_real = tren_elegido['origen']
+        destino_real = tren_elegido['destino']
+        llegada_real = tren_elegido['llegada']
         
-        # Modificamos el mensaje original para confirmar que se ha creado la alerta
+        # Lo guardamos en la base de datos con los nombres oficiales
+        add_alert(user_id, origen_real, destino_real, fecha, hora_tren, llegada_real)
+        
         texto_confirmacion = (
             f"✅ **¡Alerta registrada con éxito!**\n\n"
-            f"Te avisaré automáticamente si detecto una plaza libre para el tren "
-            f"{origen}-{destino} de las {hora_tren} el día {fecha}."
+            f"Te avisaré si detecto una plaza libre:\n"
+            f"🛤️ {origen_real} ➡️ {destino_real}\n"
+            f"📅 {fecha} | 🕒 {hora_tren} - {llegada_real}"
         )
         await query.edit_message_text(text=texto_confirmacion)
 
