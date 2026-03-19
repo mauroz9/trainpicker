@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Optional
 import httpx
 from playwright.async_api import async_playwright
 
+from database import delete_session_cache, get_session_cache, upsert_session_cache
+
 logger = logging.getLogger(__name__)
-API_TOKENS: Dict[str, Dict[str, Any]] = {}
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 
 
@@ -96,8 +97,13 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
 
 
 async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional[List[Dict[str, Any]]]:
-    session = API_TOKENS[search_key]
+    session = get_session_cache(search_key)
+    if not session:
+        return None
+
     payload = session["post_data"]
+    if payload is None:
+        payload = b""
     if isinstance(payload, str):
         payload = payload.encode("utf-8")
 
@@ -286,12 +292,13 @@ async def _capture_session_with_playwright(
             texto_dwr = await api_response.text()
             
             api_request = api_response.request
-            API_TOKENS[search_key] = {
-                "url": api_request.url,
-                "method": api_request.method,
-                "headers": await api_request.all_headers(),
-                "post_data": api_request.post_data
-            }
+            upsert_session_cache(
+                search_key=search_key,
+                url=api_request.url,
+                method=api_request.method,
+                headers=await api_request.all_headers(),
+                post_data=api_request.post_data,
+            )
             logger.info("Sesion y tokens de Renfe cacheados con exito")
 
             return parsear_dwr_renfe(texto_dwr, date_str)
@@ -309,16 +316,14 @@ async def _capture_session_with_playwright(
 async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
     search_key = _build_search_key(origin, destination, date_str)
 
-    if search_key in API_TOKENS:
-        logger.info("Sesion activa para %s. Intentando API directa", search_key)
-        try:
-            cached_result = await _fetch_with_cached_session(search_key, date_str)
-            if cached_result is not None:
-                return cached_result
-            del API_TOKENS[search_key]
-        except Exception as e:
-            logger.exception("Error en llamada API directa: %s", e)
-            if search_key in API_TOKENS:
-                del API_TOKENS[search_key]
+    logger.info("Intentando usar sesion cacheada para %s", search_key)
+    try:
+        cached_result = await _fetch_with_cached_session(search_key, date_str)
+        if cached_result is not None:
+            return cached_result
+        delete_session_cache(search_key)
+    except Exception as e:
+        logger.exception("Error en llamada API directa: %s", e)
+        delete_session_cache(search_key)
 
     return await _capture_session_with_playwright(origin, destination, date_str, search_key)

@@ -1,7 +1,8 @@
 import os
 import sqlite3
+import json
 from contextlib import contextmanager
-from typing import Generator, List, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 os.makedirs("data", exist_ok=True)
 DB_NAME = "data/renfe_alerts.db"
@@ -33,10 +34,77 @@ def init_db():
                 is_active BOOLEAN DEFAULT 1
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS session_cache (
+                search_key TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                method TEXT NOT NULL,
+                headers_json TEXT NOT NULL,
+                post_data TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         try:
             cursor.execute("ALTER TABLE alerts ADD COLUMN arrival_time TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        conn.commit()
+
+
+def upsert_session_cache(
+    search_key: str,
+    url: str,
+    method: str,
+    headers: Dict[str, str],
+    post_data: Optional[str],
+) -> None:
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO session_cache (search_key, url, method, headers_json, post_data, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(search_key) DO UPDATE SET
+                url = excluded.url,
+                method = excluded.method,
+                headers_json = excluded.headers_json,
+                post_data = excluded.post_data,
+                updated_at = CURRENT_TIMESTAMP
+            ''',
+            (search_key, url, method, json.dumps(headers), post_data),
+        )
+        conn.commit()
+
+
+def get_session_cache(search_key: str) -> Optional[Dict[str, Any]]:
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT url, method, headers_json, post_data
+            FROM session_cache
+            WHERE search_key = ?
+            ''',
+            (search_key,),
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    url, method, headers_json, post_data = row
+    return {
+        "url": url,
+        "method": method,
+        "headers": json.loads(headers_json),
+        "post_data": post_data,
+    }
+
+
+def delete_session_cache(search_key: str) -> None:
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM session_cache WHERE search_key = ?', (search_key,))
         conn.commit()
 
 def add_alert(user_id, origin, destination, date, train_time, arrival_time):
