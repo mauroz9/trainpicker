@@ -2,7 +2,7 @@ import os
 import sqlite3
 
 os.makedirs("data", exist_ok=True)
-DB_NAME = "renfe_alerts.db"
+DB_NAME = "data/renfe_alerts.db"
 
 def init_db():
     """Crea la tabla de alertas si no existe."""
@@ -54,6 +54,19 @@ def deactivate_alert(alert_id):
     cursor.execute('UPDATE alerts SET is_active = 0 WHERE id = ?', (alert_id,))
     conn.commit()
     conn.close()
+
+def get_user_alerts(user_id):
+    """Devuelve todas las alertas de un usuario específico."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, origin, destination, date, train_time, is_active 
+        FROM alerts 
+        WHERE user_id = ?
+    ''', (user_id,))
+    alerts = cursor.fetchall()
+    conn.close()
+    return alerts
 
 if __name__ == "__main__":
     init_db()

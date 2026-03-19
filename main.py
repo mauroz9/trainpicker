@@ -14,7 +14,7 @@ from telegram.ext import (
 
 # Importamos nuestro scraper y la base de datos
 from scraper import get_trains
-from database import add_alert, init_db
+from database import add_alert, init_db, get_user_alerts
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -22,6 +22,22 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 ORIGEN, DESTINO, FECHA = range(3)
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la información del bot y los comandos disponibles."""
+    mensaje = (
+        "ℹ️ *Información y Comandos Disponibles*\n\n"
+        "Soy un bot diseñado para vigilar la web de Renfe y avisarte en cuanto se libere una plaza en un tren completo.\n\n"
+        "🛠️ *Lista de Comandos:*\n"
+        "🔹 /start - Inicia el bot y muestra el mensaje de bienvenida.\n"
+        "🔹 /buscar - Inicia una nueva búsqueda de trenes paso a paso.\n"
+        "🔹 /listar - Muestra las alertas de trenes que tienes activas en este momento.\n"
+        "🔹 /cancelar - Detiene la búsqueda actual si te has equivocado al meter un dato.\n"
+        "🔹 /info - Muestra este mensaje de ayuda.\n\n"
+        "💡 *¿Cómo crear una alerta?*\n"
+        "Usa /buscar. Si el tren que quieres aparece como '❌ COMPLETO', verás un botón debajo del mensaje para crear la alerta. ¡Púlsalo y yo me encargo del resto!"
+    )
+    await update.message.reply_text(mensaje, parse_mode='Markdown')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = "🚄 ¡Hola! Te ayudaré a buscar trenes.\nUsa /buscar para iniciar una búsqueda."
@@ -81,6 +97,24 @@ async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup)
     return ConversationHandler.END
 
+async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    alertas = get_user_alerts(user_id)
+    
+    if not alertas:
+        await update.message.reply_text("📭 No tienes ninguna alerta configurada en este momento.")
+        return
+
+    mensaje = "📋 *Tus Alertas Configuradas:*\n\n"
+    for alerta in alertas:
+        alert_id, origin, destination, date, train_time, is_active = alerta
+        estado = "✅ Consultando..." if is_active else "❌ Inactiva / Ya avisada"
+        
+        mensaje += f"🔹ID{alert_id}: *{origin} ➡️ {destination}* "
+        mensaje += f"   📅 {date} | 🕒 {train_time} | {estado}\n\n"
+
+    await update.message.reply_text(mensaje, parse_mode='Markdown')
+
 async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Esta función se activa cuando un usuario hace clic en un botón Inline."""
     query = update.callback_query
@@ -135,10 +169,11 @@ def main():
     )
 
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(conv_handler)
-    
-    # Añadimos el manejador para que escuche los clics en los botones
     application.add_handler(CallbackQueryHandler(manejar_boton))
+    application.add_handler(CommandHandler('listar', listar_alertas))
+    application.add_handler(CommandHandler('info', info_command))
+    application.add_handler(conv_handler)
+
 
     print("Bot en ejecución...")
     application.run_polling()
