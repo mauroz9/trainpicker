@@ -6,7 +6,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
 from scraper import get_trains
-from database import get_active_alerts, deactivate_alert, init_db
+from database import get_active_alerts, delete_alert, init_db
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -58,7 +58,7 @@ async def check_alerts():
                                     text=mensaje,
                                     parse_mode='Markdown'
                                 )
-                                deactivate_alert(user_data['alert_id'])
+                                delete_alert(user_data['alert_id'])
                             except Exception as e:
                                 logger.error(f"Error enviando mensaje: {e}")
 

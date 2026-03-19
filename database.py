@@ -59,5 +59,12 @@ def get_user_alerts(user_id):
     conn.close()
     return alerts
 
+def delete_alert(alert_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM alerts WHERE id = ?', (alert_id,))
+    conn.commit()
+    conn.close()
+
 if __name__ == "__main__":
     init_db()
