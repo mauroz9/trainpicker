@@ -110,7 +110,7 @@ async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_id, origin, destination, date, train_time, is_active = alerta
         estado = "✅ Consultando..." if is_active else "❌ Inactiva / Ya avisada"
         
-        mensaje += f"🔹ID{alert_id}: *{origin} ➡️ {destination}* "
+        mensaje += f"🔹ID {alert_id}: *{origin} ➡️ {destination}* "
         mensaje += f"   📅 {date} | 🕒 {train_time} | {estado}\n\n"
 
     await update.message.reply_text(mensaje, parse_mode='Markdown')
