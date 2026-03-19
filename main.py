@@ -41,7 +41,19 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mensaje, parse_mode='Markdown')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_message = "🚄 ¡Hola! Te ayudaré a buscar trenes.\nUsa /buscar para iniciar una búsqueda."
+    welcome_message = (
+        "🚄 *¡Hola! Soy TrainPicker, tu vigilante personal de Renfe* 🤖\n\n"
+        "¿Cansado de ver el temido cartel de 'Tren Completo'? Mi misión es escanear la web de Renfe sin descanso y mandarte una alerta al instante en cuanto alguien devuelva un billete o se libere una plaza.\n\n"
+        "Tú solo dime qué tren quieres, ¡y yo haré el trabajo duro!\n\n"
+        "🛠️ *Comandos disponibles:*\n"
+        "🔹 /buscar - Inicia una nueva búsqueda de trenes paso a paso.\n"
+        "🔹 /listar - Muestra las alertas de trenes que tienes activas en este momento.\n"
+        "🔹 /cancelar - Detiene la búsqueda actual si te has equivocado al meter un dato.\n"
+        "🔹 /anular - Anula la alerta pulsando sobre ella.\n"
+        "🔹 /info - Muestra este mensaje de ayuda.\n\n"
+        "💡 *¿Listo para cazar billetes?*\n"
+        "Pulsa o escribe /buscar para empezar."
+    )
     await update.message.reply_text(welcome_message)
 
 async def iniciar_busqueda(update: Update, context: ContextTypes.DEFAULT_TYPE):
