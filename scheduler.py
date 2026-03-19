@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TypedDict
 
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -19,7 +19,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GroupedAlerts = Dict[Tuple[str, str, str], List[dict]]
+
+class WaitingUser(TypedDict):
+    alert_id: int
+    user_id: int
+    train_time: str
+    arrival_time: str
+
+
+GroupedAlerts = Dict[Tuple[str, str, str], List[WaitingUser]]
 
 
 def _group_alerts(alerts) -> GroupedAlerts:
@@ -36,7 +44,13 @@ def _group_alerts(alerts) -> GroupedAlerts:
     return grouped_searches
 
 
-async def _notify_users_for_route(bot: Bot, origin: str, destination: str, date: str, users_waiting: List[dict]):
+async def _notify_users_for_route(
+    bot: Bot,
+    origin: str,
+    destination: str,
+    date: str,
+    users_waiting: List[WaitingUser],
+):
     trenes = await get_trains(origin, destination, date)
     if not trenes:
         return

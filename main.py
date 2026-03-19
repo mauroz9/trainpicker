@@ -114,7 +114,7 @@ async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_T
 
     context.user_data['trenes_encontrados'] = trenes
     mensaje_respuesta, reply_markup = _build_trains_message(fecha, trenes)
-    await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup)
+    await update.message.reply_text(mensaje_respuesta, reply_markup=reply_markup, parse_mode='Markdown')
     return ConversationHandler.END
 
 async def listar_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -143,7 +143,7 @@ async def cancel_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 No tienes alertas activas para anular.")
         return
 
-    await update.message.reply_text("🗑️ **Selecciona la alerta que quieres anular:**")
+    await update.message.reply_text("🗑️ **Selecciona la alerta que quieres anular:**", parse_mode='Markdown')
     
     for alerta in alertas:
         alert_id, origin, destination, date, train_time, arrival_time, _ = alerta
@@ -198,7 +198,7 @@ async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not TOKEN:
-        print("Error: No hay token configurado.")
+        logger.error("Error: No hay token configurado.")
         return
 
     init_db()
@@ -221,8 +221,7 @@ def main():
     application.add_handler(CommandHandler('anular', cancel_alert))
     application.add_handler(conv_handler)
 
-
-    print("Bot en ejecución...")
+    logger.info("Bot en ejecución...")
     application.run_polling()
 
 if __name__ == '__main__':

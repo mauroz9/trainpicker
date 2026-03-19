@@ -8,6 +8,7 @@ from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 API_TOKENS: Dict[str, Dict[str, Any]] = {}
+ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 
 
 def _build_search_key(origin: str, destination: str, date_str: str) -> str:
@@ -22,9 +23,9 @@ def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
 
 
 def _decode_escaped_text(value: str) -> str:
-    return codecs.decode(value, "unicode_escape").title()
+    return codecs.decode(value, "unicode_escape")
 
-def parsear_dwr_renfe(texto_dwr, date_str):
+def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
     """
     Parsea la respuesta DWR de Renfe.
     Aplica la triple regla de disponibilidad: tarifas nulas, solo plazas H, o bloqueo tipo 3.
@@ -136,7 +137,7 @@ async def _capture_session_with_playwright(
         )
         page = await context.new_page()
 
-        await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ["document", "script", "xhr", "fetch"] else route.abort())
+        await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ALLOWED_RESOURCE_TYPES else route.abort())
 
         try:
             logger.info("Buscando trenes: %s -> %s el %s", origin, destination, date_str)
@@ -145,8 +146,8 @@ async def _capture_session_with_playwright(
             try:
                 await page.click("button#onetrust-accept-btn-handler", timeout=5000)
                 await page.wait_for_timeout(500)
-            except:
-                pass 
+            except Exception:
+                pass
 
             await page.click("input#origin")
             await page.wait_for_timeout(200)
@@ -170,7 +171,7 @@ async def _capture_session_with_playwright(
 
             try:
                 await page.click("label[for='trip-go']", timeout=5000)
-            except:
+            except Exception:
                 await page.evaluate(
                     """
                     () => {
