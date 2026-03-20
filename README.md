@@ -32,7 +32,7 @@ Gracias a Docker y Docker Compose, desplegar este bot es extremadamente sencillo
 
 **Clona este repositorio:**
 ```bash
-git clone https://github.com/mauroz9/trainpicker-helper
+git clone https://github.com/mauroz9/trainpicker
 cd renfe-bot
 ```
 
