@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
-from scraper import build_search_key, close_browser, get_trains_cached_only, refresh_session
+from scraper import build_search_key, close_browser, get_consecutive_capture_failures, get_trains_cached_only, refresh_session
 from database import get_active_alerts, delete_alert, get_session_cache, init_db
 
 from datetime import datetime
@@ -17,12 +17,24 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FAST_CHECK_INTERVAL_SECONDS = int(os.getenv("FAST_CHECK_INTERVAL_SECONDS", "3"))
 SESSION_REFRESH_INTERVAL_SECONDS = int(os.getenv("SESSION_REFRESH_INTERVAL_SECONDS", "20"))
 MAX_CONCURRENT_REFRESHES = int(os.getenv("MAX_CONCURRENT_REFRESHES", "2"))
+# Alerta al admin si la captura de sesion de Renfe (Playwright) falla varias
+# veces seguidas: puede indicar que Renfe cambio su web (issue #22). Opcional:
+# si ADMIN_CHAT_ID no esta configurado, esta comprobacion se desactiva.
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+ADMIN_FAILURE_THRESHOLD = int(os.getenv("ADMIN_FAILURE_THRESHOLD", "5"))
 
 logging.basicConfig(
     format='%(asctime)s - SCHEDULER - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+if not ADMIN_CHAT_ID:
+    logger.info("ADMIN_CHAT_ID no configurado: alertas de fallo consecutivo del scraper desactivadas")
+
+# Evita reenviar la alerta en cada ciclo mientras el fallo persiste: solo se
+# notifica en la transicion a estado "fallando" y se resetea al recuperarse.
+_admin_already_alerted = False
 
 
 class WaitingUser(TypedDict):
@@ -157,6 +169,32 @@ async def _refresh_route(
     await _notify_users_for_route(bot, origin, destination, date, users_waiting, trenes)
 
 
+async def _check_admin_alert(bot: Bot):
+    """Avisa al admin (una sola vez por racha) si el scraper lleva varios
+    fallos consecutivos capturando la sesion de Renfe. Ver issue #22."""
+    global _admin_already_alerted
+
+    if not ADMIN_CHAT_ID:
+        return
+
+    failures = get_consecutive_capture_failures()
+
+    if failures == 0:
+        _admin_already_alerted = False
+        return
+
+    if failures >= ADMIN_FAILURE_THRESHOLD and not _admin_already_alerted:
+        mensaje = (
+            f"⚠️ TrainPicker: {failures} capturas de Renfe consecutivas han "
+            f"fallado — Renfe pudo cambiar su web. Revisa los logs."
+        )
+        try:
+            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=mensaje)
+            _admin_already_alerted = True
+        except Exception as e:
+            logger.error("Error enviando alerta de admin: %s", e)
+
+
 async def refresh_sessions():
     """Job lento: recaptura con Playwright solo las rutas sin cache valido.
 
@@ -183,6 +221,7 @@ async def refresh_sessions():
             _refresh_route(semaphore, bot, origin, destination, date, users_waiting)
             for (origin, destination, date), users_waiting in routes_needing_refresh
         ])
+        await _check_admin_alert(bot)
 
 async def main():
     if not TOKEN:

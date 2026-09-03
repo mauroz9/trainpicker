@@ -13,6 +13,15 @@ logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 AUTOCOMPLETE_TYPE_DELAY_MS = 60
 
+# Contador de fallos consecutivos de _capture_session_with_playwright. Permite a
+# scheduler.py detectar roturas del scraper (p.ej. Renfe cambia su web) que de
+# otro modo son indistinguibles de "no hay trenes disponibles" (issue #22).
+_consecutive_capture_failures: int = 0
+
+
+def get_consecutive_capture_failures() -> int:
+    return _consecutive_capture_failures
+
 
 def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
     return {
@@ -247,6 +256,8 @@ async def _capture_session_with_playwright(
     date_str: str,
     search_key: str,
 ) -> List[Dict[str, Any]]:
+    global _consecutive_capture_failures
+
     logger.info("Iniciando Playwright para capturar sesion de Renfe")
 
     browser = await _get_browser()
@@ -414,9 +425,12 @@ async def _capture_session_with_playwright(
         )
         logger.info("Sesion y tokens de Renfe cacheados con exito")
 
+        _consecutive_capture_failures = 0
+
         return parsear_dwr_renfe(texto_dwr, date_str)
 
     except Exception as e:
+        _consecutive_capture_failures += 1
         logger.exception("Error durante captura de sesion DWR: %s", e)
         await page.screenshot(path="error_renfe.png", full_page=True)
         return []
