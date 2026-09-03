@@ -1,0 +1,35 @@
+# Compose de PRODUCCIÓN: nunca hace build, siempre despliega una imagen ya
+# construida y publicada en el GitLab Container Registry vía scripts/release.sh
+# (o release.ps1). Uso en el servidor:
+#
+#   docker compose --env-file .env.prod -f compose.prod.yml pull
+#   docker compose --env-file .env.prod -f compose.prod.yml up -d
+#
+# Para desarrollo local sigue usándose docker-compose.yml (build: . tal cual).
+# Ver README.md, sección "Desplegar en producción (GitLab Container Registry)".
+
+services:
+  telegram_bot:
+    image: ${GITLAB_REGISTRY_IMAGE}:${IMAGE_TAG}
+    container_name: renfe_bot_app
+    command: python main.py
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    volumes:
+      - renfe_database:/app/data
+
+  renfe_scheduler:
+    image: ${GITLAB_REGISTRY_IMAGE}:${IMAGE_TAG}
+    container_name: renfe_bot_scheduler
+    command: python scheduler.py
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    volumes:
+      - renfe_database:/app/data
+    depends_on:
+      - telegram_bot
+
+volumes:
+  renfe_database:
