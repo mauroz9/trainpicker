@@ -23,6 +23,14 @@ set -euo pipefail
 
 REGISTRY_IMAGE="${GITLAB_REGISTRY_IMAGE:?Debes exportar GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/trainpicker-group/trainpicker-project)}"
 
+# Plataforma del servidor de producción, no la de la máquina donde se hace el
+# build. Si compilas desde un Mac Apple Silicon (arm64) sin fijar esto, la
+# imagen publicada solo tiene manifest arm64 y el `pull` en un servidor
+# linux/amd64 falla con "no matching manifest for linux/amd64". buildx
+# compila en emulación (QEMU) cuando la plataforma pedida no coincide con la
+# del host, así que esto funciona igual desde Mac Intel/Apple Silicon o Linux.
+RELEASE_PLATFORM="${RELEASE_PLATFORM:-linux/amd64}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -39,8 +47,8 @@ while docker buildx imagetools inspect "${REGISTRY_IMAGE}:${DATE_PREFIX}.${N}" >
 done
 TAG="${DATE_PREFIX}.${N}"
 
-echo "Construyendo y publicando ${REGISTRY_IMAGE}:${TAG}..."
-docker buildx build --push -t "${REGISTRY_IMAGE}:${TAG}" .
+echo "Construyendo y publicando ${REGISTRY_IMAGE}:${TAG} (${RELEASE_PLATFORM})..."
+docker buildx build --push --platform "${RELEASE_PLATFORM}" -t "${REGISTRY_IMAGE}:${TAG}" .
 
 cat <<EOF
 

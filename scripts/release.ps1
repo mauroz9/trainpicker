@@ -34,6 +34,13 @@ if (-not $env:GITLAB_REGISTRY_IMAGE) {
 }
 $RegistryImage = $env:GITLAB_REGISTRY_IMAGE
 
+# Plataforma del servidor de producción, no la de la máquina donde se hace el
+# build. Sin esto, si compilas desde una máquina con arquitectura distinta a
+# la del servidor (p. ej. Mac Apple Silicon / arm64), la imagen publicada
+# solo tiene manifest para esa arquitectura y el `pull` en un servidor
+# linux/amd64 falla con "no matching manifest for linux/amd64".
+$ReleasePlatform = if ($env:RELEASE_PLATFORM) { $env:RELEASE_PLATFORM } else { "linux/amd64" }
+
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $RepoRoot
 try {
@@ -53,8 +60,8 @@ try {
         $N++
     }
 
-    Write-Host "Construyendo y publicando ${RegistryImage}:${Tag}..."
-    docker buildx build --push -t "${RegistryImage}:${Tag}" .
+    Write-Host "Construyendo y publicando ${RegistryImage}:${Tag} (${ReleasePlatform})..."
+    docker buildx build --push --platform "${ReleasePlatform}" -t "${RegistryImage}:${Tag}" .
     if ($LASTEXITCODE -ne 0) { exit 1 }
 
     Write-Host ""

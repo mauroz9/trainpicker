@@ -206,6 +206,17 @@ mkdir data
 - ✅ Revisa que el token sea válido (@BotFather)
 - ✅ Asegúrate de que no hay firewall bloqueando salidas HTTPS
 
+### El servidor falla con "no matching manifest for linux/amd64"
+
+- ✅ La imagen se publicó para una arquitectura distinta a la del servidor
+  (típico si compilas desde un Mac Apple Silicon / arm64 y el servidor es
+  linux/amd64, el caso más común en VPS). `scripts/release.sh`/`.ps1` ya
+  fijan `--platform linux/amd64` por defecto (usando emulación QEMU vía
+  buildx si compilas desde otra arquitectura), así que basta con publicar un
+  release nuevo. Si tu servidor no es amd64, exporta `RELEASE_PLATFORM` con
+  la plataforma correcta antes de lanzar el script (ej.
+  `RELEASE_PLATFORM=linux/arm64`).
+
 ### `scripts/release.sh`/`.ps1` falla con "blob unknown to registry"
 - ✅ Es un problema conocido del **containerd image store** de Docker
   Desktop (activado por defecto en versiones recientes): si el build y el
