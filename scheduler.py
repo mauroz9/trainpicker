@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
-from scraper import build_search_key, get_trains_cached_only, refresh_session
+from scraper import build_search_key, close_browser, get_trains_cached_only, refresh_session
 from database import get_active_alerts, delete_alert, get_session_cache, init_db
 
 from datetime import datetime
@@ -215,6 +215,7 @@ async def main():
         await asyncio.Event().wait()
     finally:
         scheduler.shutdown()
+        await close_browser()
 
 if __name__ == '__main__':
     asyncio.run(main())
