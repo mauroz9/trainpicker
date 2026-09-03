@@ -32,12 +32,36 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
     """
     Parsea la respuesta DWR de Renfe.
 
-    Disponibilidad: se usa `completo` (flag booleano que Renfe ya calcula en
-    servidor con toda la informacion de plazas/tarifas) como señal principal,
-    combinada en OR con la triple regla heuristica original (tarifas nulas,
-    solo plazas H, o bloqueo tipo 3) para no perder cobertura frente a casos
-    que `completo` no contemplase. Ver PR de la tarea #12 para el analisis
-    con datos reales de Renfe que valida este comportamiento.
+    Disponibilidad: parte de la logica real que usa el propio frontend de
+    Renfe (`listaTrenes.js`, funcion que decide entre las plantillas
+    `trenTemplateCompleto` / `trenTemplateBloqueado` / `trenTemplateNoCircula`
+    / `trenTemplateNoVenta`) para decidir si un tren es comprable, mas una
+    restriccion adicional de negocio propia de TrainPicker. Un tren se
+    considera NO disponible si se cumple cualquiera de:
+      - `completo == true`.
+      - `razonNoDisponible` esta presente, no vacio y distinto de `"8"`
+        (Renfe usa el codigo "8" solo para incidencias informativas -p.ej.
+        limitaciones de velocidad de Adif- que no bloquean la venta; el resto
+        de codigos observados -"3" completo, "4" trayecto bloqueado, "5"/"6"/
+        "7" no circula- si la bloquean, igual que cualquier codigo nuevo no
+        catalogado, replicando el `else` final de esa misma funcion).
+      - `tarifasDisponibles == null` (sin tarifas no hay nada que comprar).
+      - `soloPlazaH == true`: en el frontend de Renfe esto NO bloquea el
+        flujo de compra (solo cambia que plantilla/icono se pinta), pero
+        significa que las unicas plazas que quedan son plazas H, reservadas
+        para personas con movilidad reducida. Un usuario sin esa necesidad
+        no puede comprarlas en la practica, asi que para el caso de uso de
+        TrainPicker (avisar cuando se libera una plaza normal) se trata como
+        tren completo.
+    Ver PR de la tarea #5 para el analisis con datos reales y el volcado del
+    JS de Renfe que respalda esta logica.
+
+    Fail-closed ante roturas de formato: si ninguna de las cuatro señales
+    (`completo`, `tarifasDisponibles`, `razonNoDisponible`, `soloPlazaH`)
+    matchea en un bloque, se asume que Renfe cambio el formato del DWR. En
+    vez de marcar el tren como disponible por defecto (fail-open silencioso,
+    tarea #5), se marca como NO disponible y se loguea un warning explicito
+    para detectar la rotura cuanto antes.
 
     Ademas de `disponible` (contrato estable que consumen `main.py` y
     `scheduler.py`), se exponen campos adicionales del bloque -tren, duracion,
@@ -65,8 +89,8 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
 
             completo_m = re.search(r'completo:\s*(true|false)', bloque)
             tarifas_m = re.search(r'tarifasDisponibles:\s*(null|\[)', bloque)
-            solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
             razon_m = re.search(r'razonNoDisponible:\s*(null|"[^"]*")', bloque)
+            solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
 
             tren_m = re.search(r'cdgoTren:\s*"([^"]*)"', bloque)
             duracion_m = re.search(r'duracionViaje:\s*"([^"]*)"', bloque)
@@ -82,20 +106,28 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
                 origen_real = _decode_escaped_text(origen_m.group(1)) if origen_m else ""
                 destino_real = _decode_escaped_text(destino_m.group(1)) if destino_m else ""
 
-                is_full = False
-
-                if completo_m and completo_m.group(1) == 'true':
+                if not (completo_m or tarifas_m or razon_m or solo_plazah_m):
+                    logger.warning(
+                        "parsear_dwr_renfe: no se encontro ninguna señal de disponibilidad "
+                        "(completo/tarifasDisponibles/razonNoDisponible/soloPlazaH) para el "
+                        "tren %s (salida %s, %s). Renfe pudo cambiar el formato del DWR; se "
+                        "marca como no disponible por seguridad.",
+                        tren_m.group(1) if tren_m else "?", salida, target_date,
+                    )
                     is_full = True
+                else:
+                    is_full = False
 
-                if tarifas_m and tarifas_m.group(1) == 'null':
-                    is_full = True
+                    if completo_m and completo_m.group(1) == 'true':
+                        is_full = True
 
-                if solo_plazah_m and solo_plazah_m.group(1) == 'true':
-                    is_full = True
+                    if tarifas_m and tarifas_m.group(1) == 'null':
+                        is_full = True
 
-                if razon_m:
-                    razon = razon_m.group(1)
-                    if razon == '"3"':
+                    if razon_m and razon_m.group(1) not in ('null', '"8"'):
+                        is_full = True
+
+                    if solo_plazah_m and solo_plazah_m.group(1) == 'true':
                         is_full = True
 
                 tren_data = {
