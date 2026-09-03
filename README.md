@@ -202,15 +202,21 @@ vez de `build:`) y `.env.prod` (variables de producción, nunca se commitea).
 [gitlab.com](https://gitlab.com)):
 
 - "New project" → "Create blank project". No hace falta subir código: este
-  proyecto solo se usa para alojar el Container Registry. Nómbralo, por
-  ejemplo, `trainpicker`.
-- Anota el namespace (tu usuario o grupo) y el nombre del proyecto — el path
-  de tu imagen será `registry.gitlab.com/<namespace>/<proyecto>`. Puedes
-  verlo tal cual en el proyecto, en **Deploy → Container Registry** (GitLab
-  te muestra ahí el path exacto y ejemplos de `docker login`/`docker push`).
+  proyecto solo se usa para alojar el Container Registry.
+- El path de la imagen es siempre `registry.gitlab.com/<namespace>/<proyecto>`,
+  igual que la URL del proyecto. Puedes verlo tal cual en **Deploy →
+  Container Registry** (GitLab te muestra ahí el path exacto y ejemplos de
+  `docker login`/`docker push`).
 - El Container Registry viene habilitado por defecto en gitlab.com. Si no
   aparece la sección "Container Registry" en el menú, revísalo en
   **Settings → General → Visibility, project features, permissions**.
+
+> Para TrainPicker, el proyecto ya está creado en
+> https://gitlab.com/trainpicker-group/trainpicker-project, así que la
+> imagen es `registry.gitlab.com/trainpicker-group/trainpicker-project`
+> (usado como ejemplo en el resto de esta sección). Verifica en **Deploy →
+> Container Registry** de ese proyecto que el registry esté habilitado antes
+> de seguir con el paso 2.
 
 **2. Crea dos Deploy Tokens** (Settings → Repository → Deploy tokens), uno
 para publicar y otro para desplegar, con el mínimo permiso necesario cada
@@ -238,23 +244,23 @@ clonar el repo):
 cp .env.prod.example .env.prod
 ```
 
-Edita `.env.prod` y rellena `GITLAB_REGISTRY_IMAGE` con el path real
-(`registry.gitlab.com/<namespace>/<proyecto>`) y el resto de variables de la
-aplicación (token de Telegram, intervalos) igual que harías en `.env`. Deja
-`IMAGE_TAG` vacío por ahora — se rellena en cada release.
+Edita `.env.prod` y rellena `GITLAB_REGISTRY_IMAGE` con
+`registry.gitlab.com/trainpicker-group/trainpicker-project` y el resto de
+variables de la aplicación (token de Telegram, intervalos) igual que harías
+en `.env`. Deja `IMAGE_TAG` vacío por ahora — se rellena en cada release.
 
 ### Publicar un release (desde tu máquina, no en el servidor)
 
 ```bash
 git status --short   # confirma que no queda nada sin commitear
-export GITLAB_REGISTRY_IMAGE=registry.gitlab.com/<namespace>/<proyecto>
+export GITLAB_REGISTRY_IMAGE=registry.gitlab.com/trainpicker-group/trainpicker-project
 ./scripts/release.sh
 ```
 
 En Windows/PowerShell:
 
 ```powershell
-$env:GITLAB_REGISTRY_IMAGE = "registry.gitlab.com/<namespace>/<proyecto>"
+$env:GITLAB_REGISTRY_IMAGE = "registry.gitlab.com/trainpicker-group/trainpicker-project"
 ./scripts/release.ps1
 ```
 

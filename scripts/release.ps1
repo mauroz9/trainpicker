@@ -17,14 +17,14 @@
     Registry)".
 
 .EXAMPLE
-    $env:GITLAB_REGISTRY_IMAGE = "registry.gitlab.com/tu-namespace/trainpicker"
+    $env:GITLAB_REGISTRY_IMAGE = "registry.gitlab.com/trainpicker-group/trainpicker-project"
     ./scripts/release.ps1
 #>
 
 $ErrorActionPreference = "Stop"
 
 if (-not $env:GITLAB_REGISTRY_IMAGE) {
-    Write-Error "Debes definir la variable de entorno GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/tu-namespace/trainpicker)"
+    Write-Error "Debes definir la variable de entorno GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/trainpicker-group/trainpicker-project)"
     exit 1
 }
 $RegistryImage = $env:GITLAB_REGISTRY_IMAGE

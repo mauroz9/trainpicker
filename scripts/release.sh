@@ -6,7 +6,7 @@ set -euo pipefail
 # un tag ya publicado, así el tag anterior queda disponible para rollback.
 #
 # Uso:
-#   GITLAB_REGISTRY_IMAGE=registry.gitlab.com/tu-namespace/trainpicker ./scripts/release.sh
+#   GITLAB_REGISTRY_IMAGE=registry.gitlab.com/trainpicker-group/trainpicker-project ./scripts/release.sh
 #
 # Requiere:
 #   - Estar autenticado contra el registry con un token con permiso de
@@ -17,7 +17,7 @@ set -euo pipefail
 #
 # Ver README.md, sección "Desplegar en producción (GitLab Container Registry)".
 
-REGISTRY_IMAGE="${GITLAB_REGISTRY_IMAGE:?Debes exportar GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/tu-namespace/trainpicker)}"
+REGISTRY_IMAGE="${GITLAB_REGISTRY_IMAGE:?Debes exportar GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/trainpicker-group/trainpicker-project)}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
