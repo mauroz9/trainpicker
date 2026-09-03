@@ -109,13 +109,28 @@ renfe-bot/
 
 ### Cambiar intervalo de revisión de alertas
 
-En `scheduler.py`, línea 38, cambia `seconds=5` por el intervalo que prefieras:
-```python
-# Para revisar cada 5 segundos en producción:
-scheduler.add_job(check_alerts, 'interval', seconds=5)
+`scheduler.py` corre dos jobs independientes para que una ruta que necesite
+recapturar sesión con Playwright (10-30s) no retrase la comprobación del
+resto de rutas:
 
-# Para cada 30 segundos (depuración):
-scheduler.add_job(check_alerts, 'interval', seconds=30)
+- `fast_check_alerts`: solo lee la sesión ya cacheada (sin abrir navegador).
+  Si una ruta no tiene cache válido, se salta ese ciclo para esa ruta.
+- `refresh_sessions`: recaptura con Playwright solo las rutas activas sin
+  cache válido, acotado por un semáforo para no abrir demasiados navegadores
+  a la vez. Si la recaptura ya trae plaza libre, notifica al instante.
+
+Ambos intervalos (y el límite de recapturas concurrentes) se configuran por
+variables de entorno en `.env` (ver `.env.example`):
+
+```bash
+# Cada cuánto se comprueba la sesión cacheada (recomendado 3s)
+FAST_CHECK_INTERVAL_SECONDS=3
+
+# Cada cuánto se recaptura con Playwright la sesión de las rutas sin cache (recomendado 20s)
+SESSION_REFRESH_INTERVAL_SECONDS=20
+
+# Máximo de recapturas con Playwright en paralelo (recomendado 2)
+MAX_CONCURRENT_REFRESHES=2
 ```
 
 ### Usar una base de datos centralizada

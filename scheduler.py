@@ -1,19 +1,22 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Tuple, TypedDict
+from typing import Any, Dict, List, Tuple, TypedDict
 
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
-from scraper import get_trains
-from database import get_active_alerts, delete_alert, init_db
+from scraper import build_search_key, get_trains_cached_only, refresh_session
+from database import get_active_alerts, delete_alert, get_session_cache, init_db
 
 from datetime import datetime
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+FAST_CHECK_INTERVAL_SECONDS = int(os.getenv("FAST_CHECK_INTERVAL_SECONDS", "3"))
+SESSION_REFRESH_INTERVAL_SECONDS = int(os.getenv("SESSION_REFRESH_INTERVAL_SECONDS", "20"))
+MAX_CONCURRENT_REFRESHES = int(os.getenv("MAX_CONCURRENT_REFRESHES", "2"))
 
 logging.basicConfig(
     format='%(asctime)s - SCHEDULER - %(levelname)s - %(message)s',
@@ -52,8 +55,8 @@ async def _notify_users_for_route(
     destination: str,
     date: str,
     users_waiting: List[WaitingUser],
+    trenes: List[Dict[str, Any]],
 ):
-    trenes = await get_trains(origin, destination, date)
     if not trenes:
         return
 
@@ -83,13 +86,12 @@ async def _notify_users_for_route(
             except Exception as e:
                 logger.error("Error enviando mensaje: %s", e)
 
-async def check_alerts():
-    logger.info("Iniciando revisión de alertas...")
-
+def _get_valid_grouped_alerts() -> GroupedAlerts:
+    """Descarta alertas de trenes ya pasados y agrupa el resto por ruta+fecha."""
     alerts = get_active_alerts()
     if not alerts:
-        return
-    
+        return {}
+
     now = datetime.now()
     valid_alerts = []
 
@@ -109,17 +111,78 @@ async def check_alerts():
             logger.error("Error al comprobar la caducidad de la alerta %s: %s", alert_id, e)
             valid_alerts.append(alert)
 
-    if not valid_alerts:
-        logger.info("Todas las alertas estaban caducadas. Fin de revisión.")
+    return _group_alerts(valid_alerts)
+
+
+async def fast_check_alerts():
+    """Job rapido: solo lee la sesion cacheada, nunca abre Playwright.
+
+    Si una ruta no tiene sesion cacheada valida, se salta ese ciclo para esa
+    ruta sin bloquear la comprobacion de las demas. `refresh_sessions` es
+    quien se encarga de recapturar la sesion con Playwright.
+    """
+    grouped_searches = _get_valid_grouped_alerts()
+    if not grouped_searches:
         return
-    
-    grouped_searches = _group_alerts(valid_alerts)
 
     async with Bot(token=TOKEN) as bot:
         for (origin, destination, date), users_waiting in grouped_searches.items():
-            await _notify_users_for_route(bot, origin, destination, date, users_waiting)
+            try:
+                trenes = await get_trains_cached_only(origin, destination, date)
+            except Exception as e:
+                logger.exception("Error en fast_check_alerts para %s -> %s: %s", origin, destination, e)
+                continue
 
-    logger.info("Revisión de alertas finalizada.")
+            if trenes is None:
+                continue
+
+            await _notify_users_for_route(bot, origin, destination, date, users_waiting, trenes)
+
+
+async def _refresh_route(
+    semaphore: asyncio.Semaphore,
+    bot: Bot,
+    origin: str,
+    destination: str,
+    date: str,
+    users_waiting: List[WaitingUser],
+):
+    async with semaphore:
+        try:
+            trenes = await refresh_session(origin, destination, date)
+        except Exception as e:
+            logger.exception("Error recapturando sesion para %s -> %s: %s", origin, destination, e)
+            return
+
+    await _notify_users_for_route(bot, origin, destination, date, users_waiting, trenes)
+
+
+async def refresh_sessions():
+    """Job lento: recaptura con Playwright solo las rutas sin cache valido.
+
+    Acotado por `MAX_CONCURRENT_REFRESHES` para no abrir demasiados
+    navegadores a la vez. Si la recaptura ya trae plaza libre, notifica al
+    instante en vez de esperar al siguiente `fast_check_alerts`.
+    """
+    grouped_searches = _get_valid_grouped_alerts()
+    if not grouped_searches:
+        return
+
+    routes_needing_refresh = [
+        (route, users_waiting)
+        for route, users_waiting in grouped_searches.items()
+        if get_session_cache(build_search_key(*route)) is None
+    ]
+
+    if not routes_needing_refresh:
+        return
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REFRESHES)
+    async with Bot(token=TOKEN) as bot:
+        await asyncio.gather(*[
+            _refresh_route(semaphore, bot, origin, destination, date, users_waiting)
+            for (origin, destination, date), users_waiting in routes_needing_refresh
+        ])
 
 async def main():
     if not TOKEN:
@@ -130,8 +193,21 @@ async def main():
 
     init_db()
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_alerts, 'interval', seconds=5)
-    logger.info("Job programado: revisar alertas cada 5 segundos")
+    scheduler.add_job(
+        fast_check_alerts, 'interval',
+        seconds=FAST_CHECK_INTERVAL_SECONDS,
+        max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        refresh_sessions, 'interval',
+        seconds=SESSION_REFRESH_INTERVAL_SECONDS,
+        max_instances=1, coalesce=True,
+    )
+    logger.info(
+        "Jobs programados: fast_check_alerts cada %ss (solo cache), "
+        "refresh_sessions cada %ss (Playwright, max %s concurrentes)",
+        FAST_CHECK_INTERVAL_SECONDS, SESSION_REFRESH_INTERVAL_SECONDS, MAX_CONCURRENT_REFRESHES,
+    )
 
     scheduler.start()
 

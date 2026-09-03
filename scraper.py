@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 
 
-def _build_search_key(origin: str, destination: str, date_str: str) -> str:
+def build_search_key(origin: str, destination: str, date_str: str) -> str:
     return f"{origin}-{destination}-{date_str}"
 
 
@@ -314,7 +314,16 @@ async def _capture_session_with_playwright(
 
 
 async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
-    search_key = _build_search_key(origin, destination, date_str)
+    """Consulta trenes: intenta la sesion cacheada y si falla, cae a Playwright.
+
+    Pensada para el flujo de un solo usuario (alta de alerta desde `main.py`),
+    donde bloquear unos segundos en el fallback lento es aceptable. El
+    scheduler NO debe usar esta funcion para su barrido periodico: usa
+    `get_trains_cached_only` (rapido, sin Playwright) y `refresh_session`
+    (Playwright, acotado por semaforo) para no acoplar el intervalo de todas
+    las rutas a la mas lenta.
+    """
+    search_key = build_search_key(origin, destination, date_str)
 
     logger.info("Intentando usar sesion cacheada para %s", search_key)
     try:
@@ -326,4 +335,38 @@ async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[
         logger.exception("Error en llamada API directa: %s", e)
         delete_session_cache(search_key)
 
+    return await _capture_session_with_playwright(origin, destination, date_str, search_key)
+
+
+async def get_trains_cached_only(
+    origin: str, destination: str, date_str: str
+) -> Optional[List[Dict[str, Any]]]:
+    """Consulta trenes usando SOLO la sesion cacheada, sin abrir Playwright.
+
+    Pensada para el job rapido del scheduler: si no hay cache o la sesion ha
+    caducado, devuelve None de inmediato (borrando el cache caducado para que
+    `refresh_sessions` la recapture) en vez de bloquear ese ciclo con el
+    fallback lento de Playwright.
+    """
+    search_key = build_search_key(origin, destination, date_str)
+
+    try:
+        cached_result = await _fetch_with_cached_session(search_key, date_str)
+        if cached_result is not None:
+            return cached_result
+    except Exception as e:
+        logger.exception("Error en llamada API directa (cache-only) para %s: %s", search_key, e)
+
+    delete_session_cache(search_key)
+    return None
+
+
+async def refresh_session(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
+    """Recaptura la sesion de Renfe via Playwright y cachea el resultado.
+
+    Pensada para el job lento del scheduler (`refresh_sessions`), que la
+    invoca solo para las rutas sin cache valido y acotado por un semaforo
+    para no abrir demasiados navegadores a la vez.
+    """
+    search_key = build_search_key(origin, destination, date_str)
     return await _capture_session_with_playwright(origin, destination, date_str, search_key)
