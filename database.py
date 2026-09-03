@@ -11,6 +11,10 @@ ActiveAlert = Tuple[int, int, str, str, str, str, str]
 UserAlert = Tuple[int, str, str, str, str, str, int]
 
 
+def build_search_key(origin: str, destination: str, date_str: str) -> str:
+    return f"{origin}-{destination}-{date_str}"
+
+
 @contextmanager
 def _get_connection() -> Generator[sqlite3.Connection, None, None]:
     conn = sqlite3.connect(DB_NAME, timeout=10)
@@ -146,7 +150,27 @@ def get_user_alerts(user_id) -> List[UserAlert]:
 def delete_alert(alert_id):
     with _get_connection() as conn:
         cursor = conn.cursor()
+        cursor.execute('SELECT origin, destination, date FROM alerts WHERE id = ?', (alert_id,))
+        row = cursor.fetchone()
+
         cursor.execute('DELETE FROM alerts WHERE id = ?', (alert_id,))
+
+        if row:
+            origin, destination, date = row
+            cursor.execute(
+                '''
+                SELECT COUNT(*) FROM alerts
+                WHERE origin = ? AND destination = ? AND date = ? AND is_active = 1
+                ''',
+                (origin, destination, date),
+            )
+            (remaining,) = cursor.fetchone()
+            if remaining == 0:
+                cursor.execute(
+                    'DELETE FROM session_cache WHERE search_key = ?',
+                    (build_search_key(origin, destination, date),),
+                )
+
         conn.commit()
 
 if __name__ == "__main__":

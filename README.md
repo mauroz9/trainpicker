@@ -311,6 +311,30 @@ docker compose --env-file .env.prod -f compose.prod.yml up -d
 (Opcional) Usa `systemctl` o `supervisor` para reiniciar automáticamente los
 contenedores si el host se reinicia.
 
+### Limpieza en el servidor (logs e imágenes antiguas)
+
+Cada release publica un tag nuevo sin borrar los anteriores (para permitir
+rollback), y por defecto Docker no limita el tamaño de los logs de los
+contenedores. Sin limpieza periódica, ambos crecen sin tope con el tiempo:
+
+- **Logs**: `docker-compose.yml` y `compose.prod.yml` ya limitan el driver
+  `json-file` a `max-size: 10m` / `max-file: 3` por contenedor (~30 MB como
+  máximo por servicio, rotando automáticamente). Ajusta esos valores si
+  necesitas conservar más historial.
+- **Imágenes**: en el servidor, tras cada `pull`, ejecuta
+  `scripts/cleanup-images.sh` para borrar los tags de release anteriores al
+  `IMAGE_TAG` actual (nunca borra el que está desplegado) y las imágenes
+  `<none>:<none>` que puedan quedar de builds locales:
+
+  ```bash
+  GITLAB_REGISTRY_IMAGE=<mismo valor que en .env.prod> \
+  IMAGE_TAG=<mismo valor que en .env.prod> \
+  ./scripts/cleanup-images.sh
+  ```
+
+  Puedes automatizarlo con un cron en el servidor (p. ej. semanal) que
+  cargue `.env.prod` y lo lance tras cada deploy.
+
 ## 📄 Licencia
 
 Este proyecto se distribuye bajo licencia MIT. Úsalo libremente en proyectos personales.

@@ -10,6 +10,11 @@ services:
       - .env
     volumes:
       - renfe_database:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   renfe_scheduler:
     build: .
@@ -22,6 +27,11 @@ services:
       - renfe_database:/app/data
     depends_on:
       - telegram_bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   renfe_database:

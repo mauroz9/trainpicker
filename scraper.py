@@ -7,15 +7,11 @@ from typing import Any, Dict, List, Optional
 import httpx
 from playwright.async_api import Browser, Playwright, async_playwright
 
-from database import delete_session_cache, get_session_cache, upsert_session_cache
+from database import build_search_key, delete_session_cache, get_session_cache, upsert_session_cache
 
 logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 AUTOCOMPLETE_TYPE_DELAY_MS = 60
-
-
-def build_search_key(origin: str, destination: str, date_str: str) -> str:
-    return f"{origin}-{destination}-{date_str}"
 
 
 def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
