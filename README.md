@@ -192,6 +192,14 @@ mkdir data
   otro flujo manual, cambia a `docker buildx build --push` en vez de
   `docker build` + `docker push` por separado.
 
+### `docker compose pull` falla con "no matching manifest for linux/amd64"
+- ✅ La imagen se construyó para otra arquitectura (p. ej. build hecho en un
+  Mac Apple Silicon, arm64) y el servidor es amd64. Los scripts de release
+  construyen por defecto para `linux/amd64` (variable `PLATFORM`,
+  configurable si tu servidor es arm64 o quieres publicar ambas
+  arquitecturas) — vuelve a publicar el release con la versión actualizada
+  de `scripts/release.sh`/`.ps1`.
+
 ## 🚀 Desplegar en producción (GitLab Container Registry)
 
 En producción **no se hace build en el servidor**. La imagen se construye y

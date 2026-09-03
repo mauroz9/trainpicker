@@ -19,9 +19,18 @@ set -euo pipefail
 #     "blob unknown to registry" contra GitLab porque el content-store local
 #     no expone todos los blobs al hacer push después del build.
 #
+# La imagen se construye para PLATFORM (por defecto linux/amd64, el estándar
+# en VPS). Si tu máquina de desarrollo tiene otra arquitectura (p. ej. un Mac
+# Apple Silicon, arm64) y no la fijas explícitamente, buildx construiría por
+# defecto para la arquitectura local y el servidor fallaría al hacer pull con
+# "no matching manifest". Sobreescribe con PLATFORM=linux/arm64, o
+# PLATFORM=linux/amd64,linux/arm64 para publicar ambas (más lento: sin
+# hardware nativo de destino, la que no sea la tuya se construye emulada).
+#
 # Ver README.md, sección "Desplegar en producción (GitLab Container Registry)".
 
 REGISTRY_IMAGE="${GITLAB_REGISTRY_IMAGE:?Debes exportar GITLAB_REGISTRY_IMAGE (ej. registry.gitlab.com/trainpicker-group/trainpicker-project)}"
+PLATFORM="${PLATFORM:-linux/amd64}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -39,12 +48,12 @@ while docker buildx imagetools inspect "${REGISTRY_IMAGE}:${DATE_PREFIX}.${N}" >
 done
 TAG="${DATE_PREFIX}.${N}"
 
-echo "Construyendo y publicando ${REGISTRY_IMAGE}:${TAG}..."
-docker buildx build --push -t "${REGISTRY_IMAGE}:${TAG}" .
+echo "Construyendo y publicando ${REGISTRY_IMAGE}:${TAG} (${PLATFORM})..."
+docker buildx build --push --platform "${PLATFORM}" -t "${REGISTRY_IMAGE}:${TAG}" .
 
 cat <<EOF
 
-Release publicado: ${REGISTRY_IMAGE}:${TAG}
+Release publicado: ${REGISTRY_IMAGE}:${TAG} (${PLATFORM})
 
 En el servidor:
   1. Edita .env.prod y pon IMAGE_TAG=${TAG}

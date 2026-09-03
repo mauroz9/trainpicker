@@ -18,6 +18,13 @@
         GitLab porque el content-store local no expone todos los blobs al
         hacer push después del build.
 
+    La imagen se construye para $env:PLATFORM (por defecto linux/amd64, el
+    estándar en VPS). Si tu máquina tiene otra arquitectura y no lo fijas
+    explícitamente, buildx construiría por defecto para la arquitectura
+    local y el servidor fallaría al hacer pull con "no matching manifest".
+    Sobreescribe con PLATFORM=linux/arm64, o
+    PLATFORM=linux/amd64,linux/arm64 para publicar ambas (más lento).
+
     Ver README.md, sección "Desplegar en producción (GitLab Container
     Registry)".
 
@@ -33,6 +40,7 @@ if (-not $env:GITLAB_REGISTRY_IMAGE) {
     exit 1
 }
 $RegistryImage = $env:GITLAB_REGISTRY_IMAGE
+$Platform = if ($env:PLATFORM) { $env:PLATFORM } else { "linux/amd64" }
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $RepoRoot
@@ -53,12 +61,12 @@ try {
         $N++
     }
 
-    Write-Host "Construyendo y publicando ${RegistryImage}:${Tag}..."
-    docker buildx build --push -t "${RegistryImage}:${Tag}" .
+    Write-Host "Construyendo y publicando ${RegistryImage}:${Tag} (${Platform})..."
+    docker buildx build --push --platform "${Platform}" -t "${RegistryImage}:${Tag}" .
     if ($LASTEXITCODE -ne 0) { exit 1 }
 
     Write-Host ""
-    Write-Host "Release publicado: ${RegistryImage}:${Tag}"
+    Write-Host "Release publicado: ${RegistryImage}:${Tag} (${Platform})"
     Write-Host ""
     Write-Host "En el servidor:"
     Write-Host "  1. Edita .env.prod y pon IMAGE_TAG=$Tag"
