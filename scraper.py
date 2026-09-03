@@ -1,15 +1,17 @@
+import asyncio
 import codecs
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import Browser, Playwright, async_playwright
 
 from database import delete_session_cache, get_session_cache, upsert_session_cache
 
 logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
+AUTOCOMPLETE_TYPE_DELAY_MS = 60
 
 
 def build_search_key(origin: str, destination: str, date_str: str) -> str:
@@ -29,66 +31,96 @@ def _decode_escaped_text(value: str) -> str:
 def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
     """
     Parsea la respuesta DWR de Renfe.
-    Aplica la triple regla de disponibilidad: tarifas nulas, solo plazas H, o bloqueo tipo 3.
+
+    Disponibilidad: se usa `completo` (flag booleano que Renfe ya calcula en
+    servidor con toda la informacion de plazas/tarifas) como señal principal,
+    combinada en OR con la triple regla heuristica original (tarifas nulas,
+    solo plazas H, o bloqueo tipo 3) para no perder cobertura frente a casos
+    que `completo` no contemplase. Ver PR de la tarea #12 para el analisis
+    con datos reales de Renfe que valida este comportamiento.
+
+    Ademas de `disponible` (contrato estable que consumen `main.py` y
+    `scheduler.py`), se exponen campos adicionales del bloque -tren, duracion,
+    precio orientativo, si es directo y disponibilidad por tipo de plaza- para
+    dar contexto mas rico sin romper lo existente.
     """
     trenes_unicos: Dict[str, Dict[str, Any]] = {}
-    
+
     try:
         d, m, y = date_str.split('/')
         target_date = f"{y}-{m}-{d}"
-        
+
         bloques = texto_dwr.split('acercamientoViajeDestino:')
-        
+
         for bloque in bloques[1:]:
             fecha_m = re.search(r'fecha:\s*"([^"]+)"', bloque)
             if not fecha_m or fecha_m.group(1) != target_date:
-                continue 
-                
+                continue
+
             salida_m = re.search(r'horaSalida:\s*"(\d{2}:\d{2})"', bloque)
             llegada_m = re.search(r'horaLlegada:\s*"(\d{2}:\d{2})"', bloque)
 
             origen_m = re.search(r'descripcionEstacionOrigen:\s*"([^"]+)"', bloque)
             destino_m = re.search(r'descripcionEstacionDestino:\s*"([^"]+)"', bloque)
-            
+
+            completo_m = re.search(r'completo:\s*(true|false)', bloque)
             tarifas_m = re.search(r'tarifasDisponibles:\s*(null|\[)', bloque)
             solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
             razon_m = re.search(r'razonNoDisponible:\s*(null|"[^"]*")', bloque)
-            
+
+            tren_m = re.search(r'cdgoTren:\s*"([^"]*)"', bloque)
+            duracion_m = re.search(r'duracionViaje:\s*"([^"]*)"', bloque)
+            precio_m = re.search(r'tarifaMinima:\s*(null|"[^"]*")', bloque)
+            directo_m = re.search(r'directo:\s*(true|false)', bloque)
+            plaza_h_m = re.search(r'plazaHDisponible:\s*(true|false)', bloque)
+            plaza_b_m = re.search(r'plazaBDisponible:\s*(true|false)', bloque)
+
             if salida_m and llegada_m:
                 salida = salida_m.group(1)
                 llegada = llegada_m.group(1)
 
                 origen_real = _decode_escaped_text(origen_m.group(1)) if origen_m else ""
                 destino_real = _decode_escaped_text(destino_m.group(1)) if destino_m else ""
-                
-                is_full = False 
-                
+
+                is_full = False
+
+                if completo_m and completo_m.group(1) == 'true':
+                    is_full = True
+
                 if tarifas_m and tarifas_m.group(1) == 'null':
                     is_full = True
-                    
+
                 if solo_plazah_m and solo_plazah_m.group(1) == 'true':
                     is_full = True
-                    
+
                 if razon_m:
                     razon = razon_m.group(1)
                     if razon == '"3"':
                         is_full = True
-                    
-                if salida not in trenes_unicos:
-                    trenes_unicos[salida] = {
-                        "salida": salida,
-                        "llegada": llegada,
-                        "origen": origen_real.title(),
-                        "destino": destino_real.title(),
-                        "disponible": not is_full
-                    }
-                else:
-                    if not is_full:
-                        trenes_unicos[salida]["disponible"] = True
+
+                tren_data = {
+                    "salida": salida,
+                    "llegada": llegada,
+                    "origen": origen_real.title(),
+                    "destino": destino_real.title(),
+                    "disponible": not is_full,
+                    "tren": tren_m.group(1) if tren_m else None,
+                    "duracion": duracion_m.group(1) if duracion_m else None,
+                    "precio_desde": precio_m.group(1).strip('"') if precio_m and precio_m.group(1) != 'null' else None,
+                    "directo": directo_m.group(1) == 'true' if directo_m else None,
+                    "plaza_h_disponible": plaza_h_m.group(1) == 'true' if plaza_h_m else None,
+                    "plaza_b_disponible": plaza_b_m.group(1) == 'true' if plaza_b_m else None,
+                }
+
+                existente = trenes_unicos.get(salida)
+                if existente is None or (not existente["disponible"] and tren_data["disponible"]):
+                    trenes_unicos[salida] = tren_data
+                elif tren_data["disponible"]:
+                    existente["disponible"] = True
 
         trains_found = list(trenes_unicos.values())
         trains_found = sorted(trains_found, key=lambda x: x['salida'])
-        
+
         return trains_found
 
     except Exception as e:
@@ -128,6 +160,59 @@ async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional
     return None
 
 
+_playwright_instance: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+_browser_lock: Optional[asyncio.Lock] = None
+
+
+def _get_browser_lock() -> asyncio.Lock:
+    # Instanciado de forma perezosa (no a nivel de modulo) para no atarlo al
+    # primer event loop que exista en el proceso de importacion: crear un
+    # asyncio.Lock() en la carga del modulo puede quedar ligado a un loop
+    # distinto del que usa `asyncio.run(main())`. No hay punto de suspension
+    # entre el check y la asignacion, asi que es seguro sin lock adicional.
+    global _browser_lock
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    return _browser_lock
+
+
+async def _get_browser() -> Browser:
+    """Devuelve el Browser compartido a nivel de proceso, lanzandolo si hace falta.
+
+    Arrancar Chromium cuesta ~1-2s; reutilizar una unica instancia entre
+    capturas (cada una abre su propio `context`/`page`, que si se cierran)
+    evita pagar ese coste en cada refresco de sesion.
+    """
+    global _playwright_instance, _browser
+
+    async with _get_browser_lock():
+        if _browser is None or not _browser.is_connected():
+            if _playwright_instance is None:
+                _playwright_instance = await async_playwright().start()
+            _browser = await _playwright_instance.chromium.launch(headless=True)
+
+    return _browser
+
+
+async def close_browser() -> None:
+    """Cierra el Browser compartido y el proceso de Playwright, si estan activos.
+
+    Pensado para el shutdown de `main.py`/`scheduler.py`; no es obligatorio
+    llamarlo (el proceso se lleva el navegador por delante al terminar), pero
+    evita dejar el proceso de Chromium huerfano en un apagado ordenado.
+    """
+    global _playwright_instance, _browser
+
+    async with _get_browser_lock():
+        if _browser is not None:
+            await _browser.close()
+            _browser = None
+        if _playwright_instance is not None:
+            await _playwright_instance.stop()
+            _playwright_instance = None
+
+
 async def _capture_session_with_playwright(
     origin: str,
     destination: str,
@@ -136,63 +221,63 @@ async def _capture_session_with_playwright(
 ) -> List[Dict[str, Any]]:
     logger.info("Iniciando Playwright para capturar sesion de Renfe")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
+    browser = await _get_browser()
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+    )
+    page = await context.new_page()
 
-        await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ALLOWED_RESOURCE_TYPES else route.abort())
+    await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ALLOWED_RESOURCE_TYPES else route.abort())
+
+    try:
+        logger.info("Buscando trenes: %s -> %s el %s", origin, destination, date_str)
+        await page.goto("https://www.renfe.com/es/es", timeout=60000)
 
         try:
-            logger.info("Buscando trenes: %s -> %s el %s", origin, destination, date_str)
-            await page.goto("https://www.renfe.com/es/es", timeout=60000)
+            await page.click("button#onetrust-accept-btn-handler", timeout=5000)
+        except Exception:
+            pass
 
-            try:
-                await page.click("button#onetrust-accept-btn-handler", timeout=5000)
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
+        await page.click("input#origin")
+        await page.fill("input#origin", "")
+        await page.locator("input#origin").press_sequentially(origin, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
+        await page.wait_for_selector("#origin-awe li[role='option']", state="visible", timeout=5000)
+        await page.keyboard.press("ArrowDown")
+        await page.keyboard.press("Enter")
 
-            await page.click("input#origin")
-            await page.wait_for_timeout(200)
-            await page.fill("input#origin", "") 
-            await page.locator("input#origin").press_sequentially(origin, delay=150)
-            await page.wait_for_timeout(2000) 
-            await page.keyboard.press("ArrowDown")
-            await page.wait_for_timeout(200)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(800)
+        await page.click("input#destination")
+        await page.fill("input#destination", "")
+        await page.locator("input#destination").press_sequentially(destination, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
+        await page.wait_for_selector("#destination-awe li[role='option']", state="visible", timeout=5000)
+        await page.keyboard.press("ArrowDown")
+        await page.keyboard.press("Enter")
 
-            await page.click("input#destination")
-            await page.wait_for_timeout(200)
-            await page.fill("input#destination", "")
-            await page.locator("input#destination").press_sequentially(destination, delay=150)
-            await page.wait_for_timeout(2000)
-            await page.keyboard.press("ArrowDown")
-            await page.wait_for_timeout(200)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(500)
+        # El radio "solo ida" (label[for='trip-go']) vive dentro del widget de
+        # calendario ("lightpick"), que solo se monta/muestra al abrir el
+        # campo de fecha de ida (#first-input). Intentar clicarlo antes de
+        # abrir el calendario (como se hacia antes) lo deja siempre oculto,
+        # lo que quema el timeout completo de 5s en cada captura antes de
+        # caer al fallback por JS. Abrir el calendario primero lo deja
+        # clicable de verdad y evita ese coste.
+        await page.click("input#first-input")
+        try:
+            await page.wait_for_selector("label[for='trip-go']", state="visible", timeout=3000)
+            await page.click("label[for='trip-go']")
+        except Exception:
+            await page.evaluate(
+                """
+                () => {
+                    const radio = document.querySelector("input#trip-go");
+                    if (!radio) return;
+                    radio.checked = true;
+                    radio.dispatchEvent(new Event('input', { bubbles: true }));
+                    radio.dispatchEvent(new Event('change', { bubbles: true }));
+                    radio.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                }
+                """
+            )
 
-            try:
-                await page.click("label[for='trip-go']", timeout=5000)
-            except Exception:
-                await page.evaluate(
-                    """
-                    () => {
-                        const radio = document.querySelector("input#trip-go");
-                        if (!radio) return;
-                        radio.checked = true;
-                        radio.dispatchEvent(new Event('input', { bubbles: true }));
-                        radio.dispatchEvent(new Event('change', { bubbles: true }));
-                        radio.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                    }
-                    """
-                )
-            await page.wait_for_timeout(300)
-
-            fecha_asignada = await page.evaluate(
+        fecha_asignada = await page.evaluate(
                 """
                 (value) => {
                     const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value || '');
@@ -277,40 +362,39 @@ async def _capture_session_with_playwright(
                 date_str,
             )
 
-            if not fecha_asignada.get("ok"):
-                raise Exception("No se pudo aplicar la fecha de ida en el formulario")
+        if not fecha_asignada.get("ok"):
+            raise Exception("No se pudo aplicar la fecha de ida en el formulario")
 
-            logger.info("Interceptando solicitud DWR de trenes")
-            url_keyword = "getTrainsList.dwr" 
+        logger.info("Interceptando solicitud DWR de trenes")
+        url_keyword = "getTrainsList.dwr"
 
-            async with page.expect_response(lambda response: url_keyword in response.url and response.status == 200, timeout=30000) as response_info:
-                search_button = "button[title='Buscar billete']"
-                await page.wait_for_selector(search_button, state="visible", timeout=10000)
-                await page.click(search_button)
+        async with page.expect_response(lambda response: url_keyword in response.url and response.status == 200, timeout=30000) as response_info:
+            search_button = "button[title='Buscar billete']"
+            await page.wait_for_selector(search_button, state="visible", timeout=10000)
+            await page.click(search_button)
 
-            api_response = await response_info.value
-            texto_dwr = await api_response.text()
-            
-            api_request = api_response.request
-            upsert_session_cache(
-                search_key=search_key,
-                url=api_request.url,
-                method=api_request.method,
-                headers=await api_request.all_headers(),
-                post_data=api_request.post_data,
-            )
-            logger.info("Sesion y tokens de Renfe cacheados con exito")
+        api_response = await response_info.value
+        texto_dwr = await api_response.text()
 
-            return parsear_dwr_renfe(texto_dwr, date_str)
+        api_request = api_response.request
+        upsert_session_cache(
+            search_key=search_key,
+            url=api_request.url,
+            method=api_request.method,
+            headers=await api_request.all_headers(),
+            post_data=api_request.post_data,
+        )
+        logger.info("Sesion y tokens de Renfe cacheados con exito")
 
-        except Exception as e:
-            logger.exception("Error durante captura de sesion DWR: %s", e)
-            await page.screenshot(path="error_renfe.png", full_page=True)
-            return []
-            
-        finally:
-            if 'browser' in locals():
-                await browser.close()
+        return parsear_dwr_renfe(texto_dwr, date_str)
+
+    except Exception as e:
+        logger.exception("Error durante captura de sesion DWR: %s", e)
+        await page.screenshot(path="error_renfe.png", full_page=True)
+        return []
+
+    finally:
+        await context.close()
 
 
 async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
