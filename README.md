@@ -182,6 +182,16 @@ mkdir data
 - ✅ Revisa que el token sea válido (@BotFather)
 - ✅ Asegúrate de que no hay firewall bloqueando salidas HTTPS
 
+### `scripts/release.sh`/`.ps1` falla con "blob unknown to registry"
+- ✅ Es un problema conocido del **containerd image store** de Docker
+  Desktop (activado por defecto en versiones recientes): si el build y el
+  push van en comandos separados, el content-store local no expone todos
+  los blobs al hacer `docker push` después, y GitLab responde `blob unknown
+  to registry`. Los scripts de release ya usan `docker buildx build --push`
+  (build+push en un único paso) para evitarlo — si ves este error usando
+  otro flujo manual, cambia a `docker buildx build --push` en vez de
+  `docker build` + `docker push` por separado.
+
 ## 🚀 Desplegar en producción (GitLab Container Registry)
 
 En producción **no se hace build en el servidor**. La imagen se construye y

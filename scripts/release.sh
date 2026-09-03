@@ -12,8 +12,12 @@ set -euo pipefail
 #   - Estar autenticado contra el registry con un token con permiso de
 #     escritura (write_registry): docker login registry.gitlab.com
 #   - docker buildx (incluido en Docker Desktop y en Docker Engine >= 19.03
-#     con el plugin buildx instalado) para poder consultar tags existentes
-#     sin descargarlos.
+#     con el plugin buildx instalado). Se usa tanto para consultar tags
+#     existentes sin descargarlos como para hacer build+push en un único
+#     paso: con el containerd image store (por defecto en Docker Desktop
+#     reciente), separar `docker build` + `docker push` puede fallar con
+#     "blob unknown to registry" contra GitLab porque el content-store local
+#     no expone todos los blobs al hacer push después del build.
 #
 # Ver README.md, sección "Desplegar en producción (GitLab Container Registry)".
 
@@ -35,11 +39,8 @@ while docker buildx imagetools inspect "${REGISTRY_IMAGE}:${DATE_PREFIX}.${N}" >
 done
 TAG="${DATE_PREFIX}.${N}"
 
-echo "Construyendo ${REGISTRY_IMAGE}:${TAG}..."
-docker build -t "${REGISTRY_IMAGE}:${TAG}" .
-
-echo "Publicando ${REGISTRY_IMAGE}:${TAG}..."
-docker push "${REGISTRY_IMAGE}:${TAG}"
+echo "Construyendo y publicando ${REGISTRY_IMAGE}:${TAG}..."
+docker buildx build --push -t "${REGISTRY_IMAGE}:${TAG}" .
 
 cat <<EOF
 

@@ -10,8 +10,13 @@
     Requiere:
       - Estar autenticado contra el registry con un token con permiso de
         escritura (write_registry): docker login registry.gitlab.com
-      - docker buildx (incluido en Docker Desktop) para poder consultar
-        tags existentes sin descargarlos.
+      - docker buildx (incluido en Docker Desktop). Se usa tanto para
+        consultar tags existentes sin descargarlos como para hacer
+        build+push en un único paso: con el containerd image store (por
+        defecto en Docker Desktop reciente), separar "docker build" +
+        "docker push" puede fallar con "blob unknown to registry" contra
+        GitLab porque el content-store local no expone todos los blobs al
+        hacer push después del build.
 
     Ver README.md, sección "Desplegar en producción (GitLab Container
     Registry)".
@@ -48,12 +53,8 @@ try {
         $N++
     }
 
-    Write-Host "Construyendo ${RegistryImage}:${Tag}..."
-    docker build -t "${RegistryImage}:${Tag}" .
-    if ($LASTEXITCODE -ne 0) { exit 1 }
-
-    Write-Host "Publicando ${RegistryImage}:${Tag}..."
-    docker push "${RegistryImage}:${Tag}"
+    Write-Host "Construyendo y publicando ${RegistryImage}:${Tag}..."
+    docker buildx build --push -t "${RegistryImage}:${Tag}" .
     if ($LASTEXITCODE -ne 0) { exit 1 }
 
     Write-Host ""
