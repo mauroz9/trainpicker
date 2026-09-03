@@ -1,4 +1,5 @@
 .env
+.env.prod
 .git
 data/
 __pycache__/

@@ -97,10 +97,15 @@ renfe-bot/
 ├── scheduler.py            # Servicio que revisa alertas cada X segundos
 ├── scraper.py              # Navegador automatizado que busca trenes en Renfe
 ├── database.py             # Gestión de alertas (SQLite)
-├── docker-compose.yml      # Configuración de Docker Compose
+├── docker-compose.yml      # Docker Compose para desarrollo local (build: .)
+├── compose.prod.yml        # Docker Compose para producción (image: ya publicada)
 ├── Dockerfile              # Imagen Docker personalizada
+├── scripts/
+│   ├── release.sh          # Build + tag + push a GitLab Container Registry (bash)
+│   └── release.ps1         # Igual que release.sh, para Windows/PowerShell
 ├── requirements.txt        # Dependencias Python
-├── .env.example            # Plantilla de variables de entorno
+├── .env.example            # Plantilla de variables de entorno (desarrollo)
+├── .env.prod.example       # Plantilla de variables de entorno (producción)
 ├── .gitignore              # Archivos ignorados en Git
 └── README.md               # Este archivo
 ```
@@ -177,14 +182,118 @@ mkdir data
 - ✅ Revisa que el token sea válido (@BotFather)
 - ✅ Asegúrate de que no hay firewall bloqueando salidas HTTPS
 
-## 🚀 Desplegar en producción
+## 🚀 Desplegar en producción (GitLab Container Registry)
 
-Para un servidor Linux/VPS (ej. AWS, Linode, DigitalOcean):
+En producción **no se hace build en el servidor**. La imagen se construye y
+publica (build + tag + push) desde tu máquina de desarrollo hacia el GitLab
+Container Registry, y el servidor solo descarga (`pull`) la imagen ya
+verificada y la arranca. Esto da versionado real de imágenes y rollback
+trivial: si un deploy rompe algo, basta con volver a apuntar al tag anterior,
+sin reconstruir nada.
 
-1. Conecta por SSH y clona el repositorio
-2. Copia `.env.example` a `.env` y configura el token
-3. Ejecuta: `docker-compose up -d`
-4. (Opcional) Usa `systemctl` o `supervisor` para reiniciar automáticamente si cae
+`docker-compose.yml` (con `build: .`) se mantiene tal cual para desarrollo
+local — sigue siendo el onboarding más simple para quien clona el repo. Para
+producción se usan dos ficheros nuevos: `compose.prod.yml` (usa `image:` en
+vez de `build:`) y `.env.prod` (variables de producción, nunca se commitea).
+
+### Configuración inicial (una sola vez)
+
+**1. Crea un proyecto en GitLab** (si no tienes cuenta, créala gratis en
+[gitlab.com](https://gitlab.com)):
+
+- "New project" → "Create blank project". No hace falta subir código: este
+  proyecto solo se usa para alojar el Container Registry. Nómbralo, por
+  ejemplo, `trainpicker`.
+- Anota el namespace (tu usuario o grupo) y el nombre del proyecto — el path
+  de tu imagen será `registry.gitlab.com/<namespace>/<proyecto>`. Puedes
+  verlo tal cual en el proyecto, en **Deploy → Container Registry** (GitLab
+  te muestra ahí el path exacto y ejemplos de `docker login`/`docker push`).
+- El Container Registry viene habilitado por defecto en gitlab.com. Si no
+  aparece la sección "Container Registry" en el menú, revísalo en
+  **Settings → General → Visibility, project features, permissions**.
+
+**2. Crea dos Deploy Tokens** (Settings → Repository → Deploy tokens), uno
+para publicar y otro para desplegar, con el mínimo permiso necesario cada
+uno:
+
+- **Push (máquina de desarrollo):** scope `write_registry` (incluye lectura).
+  Úsalo para autenticar el `docker push` de `scripts/release.sh`/`.ps1`:
+  ```bash
+  docker login registry.gitlab.com -u <usuario-del-token> -p <token>
+  ```
+- **Pull (servidor de producción):** scope `read_registry` únicamente —
+  así el servidor nunca tiene permiso de escritura sobre el registry.
+  Autentica el servidor una vez con ese token de la misma forma
+  (`docker login registry.gitlab.com -u ... -p ...`); las credenciales
+  quedan guardadas en `~/.docker/config.json` y no hace falta repetir el
+  login en cada deploy.
+
+Guarda ambos tokens en un gestor de contraseñas: GitLab solo los muestra una
+vez al crearlos.
+
+**3. Prepara los ficheros de producción en el servidor** (una sola vez, tras
+clonar el repo):
+
+```bash
+cp .env.prod.example .env.prod
+```
+
+Edita `.env.prod` y rellena `GITLAB_REGISTRY_IMAGE` con el path real
+(`registry.gitlab.com/<namespace>/<proyecto>`) y el resto de variables de la
+aplicación (token de Telegram, intervalos) igual que harías en `.env`. Deja
+`IMAGE_TAG` vacío por ahora — se rellena en cada release.
+
+### Publicar un release (desde tu máquina, no en el servidor)
+
+```bash
+git status --short   # confirma que no queda nada sin commitear
+export GITLAB_REGISTRY_IMAGE=registry.gitlab.com/<namespace>/<proyecto>
+./scripts/release.sh
+```
+
+En Windows/PowerShell:
+
+```powershell
+$env:GITLAB_REGISTRY_IMAGE = "registry.gitlab.com/<namespace>/<proyecto>"
+./scripts/release.ps1
+```
+
+El script aborta si hay cambios sin commitear, construye la imagen, la
+taggea con un tag versionado nuevo (`AAAA.MM.DD.N`, p. ej. `2026.01.15.1` —
+nunca reutiliza uno ya publicado) y la publica en el registry. Al terminar
+imprime el tag generado.
+
+### Desplegar en el servidor
+
+```bash
+ssh usuario@tu-servidor
+cd trainpicker
+# Edita .env.prod y pon IMAGE_TAG=<tag que imprimió el script de release>
+docker compose --env-file .env.prod -f compose.prod.yml pull
+docker compose --env-file .env.prod -f compose.prod.yml up -d
+```
+
+Verifica el despliegue:
+
+```bash
+docker compose --env-file .env.prod -f compose.prod.yml ps
+docker compose --env-file .env.prod -f compose.prod.yml logs -f
+```
+
+### Rollback
+
+Si algo falla, no hace falta reconstruir nada: vuelve a poner en `.env.prod`
+el `IMAGE_TAG` del release anterior (sigue disponible en el registry) y
+repite el `pull` + `up -d`:
+
+```bash
+# .env.prod: IMAGE_TAG=<tag anterior que funcionaba>
+docker compose --env-file .env.prod -f compose.prod.yml pull
+docker compose --env-file .env.prod -f compose.prod.yml up -d
+```
+
+(Opcional) Usa `systemctl` o `supervisor` para reiniciar automáticamente los
+contenedores si el host se reinicia.
 
 ## 📄 Licencia
 

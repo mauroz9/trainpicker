@@ -1,3 +1,4 @@
 .env
+.env.prod
 data/
 error_renfe.png
