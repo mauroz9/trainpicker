@@ -138,6 +138,30 @@ SESSION_REFRESH_INTERVAL_SECONDS=20
 MAX_CONCURRENT_REFRESHES=2
 ```
 
+### Alerta al admin si el scraper deja de funcionar
+
+Si Renfe cambia el HTML/selectores de su formulario de búsqueda, la
+recaptura de sesión con Playwright (`refresh_session`) empieza a fallar en
+todos los ciclos. Sin esta comprobación eso es indistinguible de "no hay
+trenes disponibles", así que el bot deja de detectar plazas libres para
+todas las alertas activas sin que nadie se entere.
+
+Configurando `ADMIN_CHAT_ID` en `.env`, el scheduler te manda un mensaje de
+Telegram en cuanto se acumulan varios fallos de captura seguidos (una sola
+vez por incidencia, no en cada ciclo):
+
+```bash
+# Chat ID de Telegram al que se envía la alerta. Vacío = función desactivada.
+ADMIN_CHAT_ID=
+
+# Nº de capturas de sesión fallidas seguidas a partir del cual se avisa (por defecto 5)
+ADMIN_FAILURE_THRESHOLD=5
+```
+
+Para obtener tu chat ID de Telegram: escríbele a
+[@userinfobot](https://t.me/userinfobot), o mira el id numérico que el bot
+registra en los logs al recibir un mensaje tuyo.
+
 ### Usar una base de datos centralizada
 
 Por defecto, las alertas se guardan en `data/renfe_alerts.db` dentro del contenedor. Para persistencia real:
