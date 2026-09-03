@@ -13,8 +13,10 @@ UserAlert = Tuple[int, str, str, str, str, str, int]
 
 @contextmanager
 def _get_connection() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=10)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         yield conn
     finally:
         conn.close()
