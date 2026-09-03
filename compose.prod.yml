@@ -18,6 +18,11 @@ services:
       - .env.prod
     volumes:
       - renfe_database:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   renfe_scheduler:
     image: ${GITLAB_REGISTRY_IMAGE}:${IMAGE_TAG}
@@ -30,6 +35,11 @@ services:
       - renfe_database:/app/data
     depends_on:
       - telegram_bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   renfe_database:
