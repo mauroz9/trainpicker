@@ -1,5 +1,6 @@
 import os
 import logging
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
@@ -28,8 +29,12 @@ ORIGEN, DESTINO, FECHA = range(3)
 
 
 def _build_trains_message(fecha: str, trenes: List[Dict[str, Any]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    origen_real = trenes[0]['origen']
-    destino_real = trenes[0]['destino']
+    # La respuesta de Renfe mezcla trenes directos con enlaces y acercamientos,
+    # asi que la ruta del primer tren no tiene por que ser la buscada: se toma
+    # la pareja origen/destino mayoritaria para la cabecera.
+    origen_real, destino_real = Counter(
+        (tren['origen'], tren['destino']) for tren in trenes
+    ).most_common(1)[0][0]
     mensaje_respuesta = f"🚆 **Trenes {origen_real} ➡️ {destino_real} el {fecha}**\n\n"
 
     keyboard = []
@@ -41,7 +46,10 @@ def _build_trains_message(fecha: str, trenes: List[Dict[str, Any]]) -> Tuple[str
             keyboard.append([
                 InlineKeyboardButton(
                     text=f"🔔 Avisar: {tren['salida']} a {tren['llegada']}",
-                    callback_data=f"alerta_{tren['salida']}"
+                    # Salida + llegada: varios itinerarios pueden salir a la
+                    # misma hora (issue #25), asi que la hora de salida por si
+                    # sola no identifica el tren que el usuario ha elegido.
+                    callback_data=f"alerta_{tren['salida']}_{tren['llegada']}"
                 )
             ])
         mensaje_respuesta += f"🕒 {tren['salida']} - {tren['llegada']} | {estado}\n"
@@ -49,9 +57,25 @@ def _build_trains_message(fecha: str, trenes: List[Dict[str, Any]]) -> Tuple[str
     return mensaje_respuesta, InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
-def _get_selected_train(context_data: Dict[str, Any], hora_tren: str) -> Optional[Dict[str, Any]]:
+def _get_selected_train(
+    context_data: Dict[str, Any],
+    hora_tren: str,
+    hora_llegada: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Busca el tren elegido por salida y, si viene, tambien por llegada.
+
+    `hora_llegada` es opcional para que los botones enviados por una version
+    anterior del bot (callback_data sin llegada) sigan funcionando.
+    """
     trenes = context_data.get('trenes_encontrados', [])
-    return next((tren for tren in trenes if tren['salida'] == hora_tren), None)
+    return next(
+        (
+            tren for tren in trenes
+            if tren['salida'] == hora_tren
+            and (hora_llegada is None or tren['llegada'] == hora_llegada)
+        ),
+        None,
+    )
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra la información del bot y los comandos disponibles."""
@@ -205,11 +229,13 @@ async def manejar_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     datos = query.data 
     
     if datos.startswith("alerta_"):
-        hora_tren = datos.split("_")[1]
+        partes = datos.split("_")
+        hora_tren = partes[1]
+        hora_llegada = partes[2] if len(partes) > 2 else None
         user_id = query.from_user.id
         fecha = context.user_data.get('fecha')
         
-        tren_elegido = _get_selected_train(context.user_data, hora_tren)
+        tren_elegido = _get_selected_train(context.user_data, hora_tren, hora_llegada)
         
         if not tren_elegido:
             await query.edit_message_text(text="⚠️ Sesión expirada. Vuelve a usar /buscar.")
