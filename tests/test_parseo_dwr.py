@@ -37,7 +37,8 @@ def itinerario(
     completo="false",
     razon_no_disponible="null",
     solo_plaza_h="false",
-    tarifas='[{cdgoTarifa:"10",descripcion:"Basico",precio:13.2}]',
+    solo_plazas_h_tarifa=None,
+    tarifas=None,
     tarifa_minima='"13.20"',
     directo="true",
     extra="",
@@ -51,8 +52,22 @@ def itinerario(
     objeto por tramo- asi que se serializa ahi, no en el nivel superior; leerlo
     del nivel superior (como hacia una version anterior de este fixture) daba
     una falsa sensacion de cobertura, porque `scraper.py` nunca ve ese campo en
-    produccion (ver `_codigos_tren_tramo`, issue #25).
+    produccion (ver `_codigos_tren_tramo`, issue #25). Lo mismo pasa con
+    `soloPlazasH` (plural): la señal real de si la tarifa ofertada es de plaza
+    reservada vive anidada en cada fila de `tarifasDisponibles`, no en el
+    `soloPlazaH` (singular) de nivel superior -que puede venir en `false`
+    aunque la unica tarifa ofertada sea de plaza bicicleta, verificado en vivo
+    (ver `_tarifa_solo_plaza_reservada`, issue #25-B). Por defecto
+    `solo_plazas_h_tarifa` sigue a `solo_plaza_h` (caso normal, donde ambas
+    señales coinciden); se pasa distinto solo para reproducir el mismatch.
     """
+    if solo_plazas_h_tarifa is None:
+        solo_plazas_h_tarifa = solo_plaza_h
+    if tarifas is None:
+        tarifas = (
+            f'[{{cdgoClase:"T",plazaH:true,precioTarifa:"13.20",'
+            f'soloPlazasH:{solo_plazas_h_tarifa},titulo:"Adulto ida"}}]'
+        )
     trayectos = (
         ",trayectos:[{cdgoEstacionDestinoTrayecto:\"51400\",cdgoEstacionOrigenTrayecto:\"51100\","
         f"cdgoProducto:\"X\",cdgoTren:\"{cdgo_tren}\",horaLlegada:\"{hora_llegada}:00\","
@@ -196,9 +211,30 @@ class TestSenalesDeDisponibilidad(unittest.TestCase):
         self.assertEqual(tren["motivo"], "sin_tarifas")
 
     def test_solo_plaza_h(self):
+        # Caso normal: nivel superior y anidado coinciden (verificado en vivo,
+        # nunca se han visto en desacuerdo en esta direccion: 89/89 casos).
         tren = self._disponible(solo_plaza_h="true")
         self.assertFalse(tren["disponible"])
-        self.assertEqual(tren["motivo"], "solo_plaza_h")
+        self.assertEqual(tren["motivo"], "solo_plaza_reservada")
+
+    def test_solo_bici_con_nivel_superior_en_false(self):
+        # Verificado en vivo el 11/09/2026 (tren 13083, San Bernardo -> Puerto
+        # de Santa Maria): `soloPlazaH` de nivel superior viene en `false`
+        # (parece sin restriccion) pero la unica fila de tarifa ofertada tiene
+        # `soloPlazasH:true` -es una plaza bicicleta, no una normal-. Sin mirar
+        # el campo anidado, el bot marcaba este tren como disponible sin serlo
+        # (12 de 794 itinerarios reales muestreados). El motivo no distingue H
+        # de bici porque el propio campo de Renfe tampoco lo hace.
+        tren = self._disponible(solo_plaza_h="false", solo_plazas_h_tarifa="true")
+        self.assertFalse(tren["disponible"])
+        self.assertEqual(tren["motivo"], "solo_plaza_reservada")
+
+    def test_tarifa_normal_disponible_aunque_top_no_marque_plaza_h_ni_bici(self):
+        # Lo contrario tambien ocurre en datos reales: `plazaHDisponible` y
+        # `plazaBDisponible` de nivel superior en `false` no implica tarifa
+        # restringida si la propia fila de tarifa dice `soloPlazasH:false`
+        # (29 de 794 itinerarios reales). Debe seguir disponible.
+        self.assertTrue(self._disponible(solo_plaza_h="false", solo_plazas_h_tarifa="false")["disponible"])
 
     def test_razon_vacia_es_disponible(self):
         # `razonNoDisponible: ""` es "sin incidencia" en el JS de Renfe
