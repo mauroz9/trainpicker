@@ -281,6 +281,7 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
     que explica por que un tren se ha marcado como no disponible.
     """
     trenes_unicos: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    fechas_vistas: set = set()
 
     try:
         d, m, y = date_str.split('/')
@@ -289,9 +290,13 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
         logger.error("parsear_dwr_renfe: fecha invalida %r (se espera DD/MM/AAAA)", date_str)
         return []
 
-    for fields in _iter_itinerary_fields(texto_dwr):
+    itinerarios = _iter_itinerary_fields(texto_dwr)
+
+    for fields in itinerarios:
         try:
-            if _text_field(fields, "fecha") != target_date:
+            fecha_itinerario = _text_field(fields, "fecha")
+            fechas_vistas.add(fecha_itinerario)
+            if fecha_itinerario != target_date:
                 continue
 
             salida = _text_field(fields, "horaSalida")
@@ -340,6 +345,19 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
 
         except Exception as e:
             logger.exception("Error parseando un itinerario del DWR: %s", e)
+
+    if itinerarios and not trenes_unicos:
+        # Renfe respondio con itinerarios pero ninguno es de la fecha pedida.
+        # Puede ser normal (no hay trenes ese dia), pero tambien seria el
+        # sintoma de que `fecha` ha dejado de ser un campo del itinerario: en
+        # ese caso el bot diria "no se han encontrado trenes" para todo, en
+        # silencio. Se deja rastro con las fechas que si venian.
+        logger.warning(
+            "parsear_dwr_renfe: %s itinerarios en la respuesta y ninguno para %s "
+            "(fechas encontradas: %s)",
+            len(itinerarios), target_date,
+            ", ".join(sorted(f for f in fechas_vistas if f)) or "ninguna",
+        )
 
     return sorted(trenes_unicos.values(), key=lambda tren: (tren["salida"], tren["llegada"]))
 

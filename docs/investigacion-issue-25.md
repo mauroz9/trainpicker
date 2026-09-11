@@ -47,7 +47,7 @@ la misma hora, y un itinerario con enlace contiene dentro sus tramos, que
 repiten la misma forma.
 
 El parser trataba esa lista como si fuera un tren por bloque, indexado por hora
-de salida. De ahí salen los tres fallos.
+de salida. De ahí salen los fallos que siguen.
 
 ## 2. Causas encontradas
 
@@ -173,13 +173,85 @@ dice disponible.
   - `_decode_escaped_text` sustituye solo los escapes `\uXXXX`/`\xXX`.
   - Los errores se capturan por itinerario: un bloque raro ya no vacía la lista
     entera.
+  - Si la respuesta trae itinerarios pero ninguno es de la fecha pedida, se
+    loguea un warning con las fechas que sí venían (ver 5.3).
 - **`main.py`**: el `callback_data` del botón lleva salida **y** llegada, la
   cabecera del listado usa la ruta mayoritaria en vez de la del primer tren, y
   los botones antiguos (sin llegada) siguen funcionando.
 - **`scheduler.py`**: `_alert_matches_train` compara salida y llegada; las
   alertas antiguas con `arrival_time` vacío siguen casando solo por salida.
 
-## 5. Verificación pendiente (requiere acceso a Renfe)
+## 5. Pasada de verificación
+
+Además de los 26 tests, se hicieron tres comprobaciones sobre el parser nuevo:
+
+### 5.1 No hay regresión en el caso sano
+
+Con una respuesta de 8 itinerarios sin duplicados de hora ni anidamiento (3 de
+ellos completos), el parser nuevo devuelve **exactamente lo mismo** que el
+anterior: mismos trenes, mismas llegadas, misma disponibilidad. Los cambios
+solo alteran el resultado en los escenarios que estaban mal.
+
+### 5.2 Termina y no rompe ante respuestas mutiladas
+
+El recorrido nuevo lleva índices a mano (comillas, corchetes, llaves), así que
+se probó con 4.000 payloads mutados al azar (truncados, con llaves/comillas
+sueltas insertadas y caracteres borrados): **0 excepciones y 0,8 ms en el peor
+caso**. Ni cuelgues por bucle infinito ni respuestas rotas que tumben el bot.
+
+### 5.3 Riesgo asumido y blindado: `fecha` debe ser campo del itinerario
+
+El parser nuevo lee `fecha` solo del objeto del itinerario, no de cualquier
+sitio del bloque. Si Renfe moviese esa fecha a un objeto interno, el resultado
+sería una lista vacía y el bot diría "no se han encontrado trenes" para
+**todas** las búsquedas, en silencio.
+
+Que hoy es un campo del propio itinerario se deduce de que el troceado anterior
+(`split` por un nombre de campo + `re.search`) funcionaba en producción, lo que
+exige que `fecha` aparezca después del marcador y antes de cualquier anidado —
+consistente con el orden alfabético con el que DWR serializa el bean. Aun así,
+por si acaso, ahora se loguea un warning con las fechas que sí traía la
+respuesta cuando hay itinerarios pero ninguno coincide.
+
+### 5.4 Flujo completo, de punta a punta
+
+La prueba decisiva: el caso reportado (directo 18:12-19:26 completo conviviendo
+con un itinerario con enlace que sale a la misma hora y sí tiene plaza) pasado
+por el código real de `scraper.py` → `main.py` → SQLite → `scheduler.py`.
+
+Con el código anterior:
+
+```
+1) Listado que ve el usuario:
+      🕒 18:12 - 20:05 | ✅ DISPONIBLE
+     botones de alerta: NINGUNO
+>>> el bot NO ofrece alerta para el tren completo de las 18:12
+```
+
+El tren de las 18:12-19:26 ni siquiera aparece: lo ha sustituido el otro
+itinerario, pintado como disponible. Es exactamente el síntoma reportado.
+
+Con el fix:
+
+```
+1) Listado que ve el usuario:
+      🕒 18:12 - 19:26 | ❌ COMPLETO
+      🕒 18:12 - 20:05 | ✅ DISPONIBLE
+     botones de alerta: ['alerta_18:12_19:26']
+2) Pulsa 'alerta_18:12_19:26' -> alerta para 18:12-19:26
+3) Ciclo del scheduler -> notificaciones enviadas: 0
+```
+
+Y la contraprueba, para asegurar que no se ha roto la función del bot: con la
+alerta guardada en 18:12-19:26,
+
+| Estado de Renfe | Notifica |
+|---|---|
+| Solo el enlace de las 18:12 tiene plaza (el directo sigue completo) | no (antes: sí) |
+| Se libera el directo 18:12-19:26 | **sí** |
+| Todo completo | no |
+
+## 6. Verificación pendiente (requiere acceso a Renfe)
 
 1. Buscar San Bernardo → Puerto de Santa María para el 13/09/2026 en
    renfe.com, DevTools → Red → filtrar `getTrainsList.dwr` → "Copiar
@@ -201,7 +273,7 @@ otra distinta: que Renfe decide el "Tren completo" con información que no está
 en esta respuesta. En ese caso, el volcado del diagnosticador es exactamente lo
 que hace falta para abrir el siguiente issue.
 
-## 6. Hallazgos anotados y NO corregidos aquí
+## 7. Hallazgos anotados y NO corregidos aquí
 
 - **La ruta de la alerta no es la de la búsqueda.** `main.py` busca con lo que
   escribe el usuario ("San Bernardo") pero guarda la alerta con la descripción

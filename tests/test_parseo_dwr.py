@@ -244,6 +244,16 @@ class TestCamposDelTren(unittest.TestCase):
             [("18:12", "19:26"), ("18:12", "20:05"), ("20:10", "21:24")],
         )
 
+    def test_avisa_si_hay_itinerarios_pero_ninguno_de_la_fecha(self):
+        # Es lo que se veria si `fecha` dejase de ser un campo del itinerario:
+        # el bot diria "no se han encontrado trenes" para todo. Debe dejar
+        # rastro en el log en vez de fallar en silencio.
+        texto = respuesta_dwr(itinerario(fecha="2026-09-14"))
+        with self.assertLogs("scraper", level=logging.WARNING) as capturado:
+            self.assertEqual(parsear_dwr_renfe(texto, FECHA), [])
+        self.assertIn("ninguno para 2026-09-13", capturado.output[0])
+        self.assertIn("2026-09-14", capturado.output[0])
+
     def test_respuesta_vacia_o_rota(self):
         self.assertEqual(parsear_dwr_renfe("", FECHA), [])
         self.assertEqual(parsear_dwr_renfe("cualquier cosa", FECHA), [])
