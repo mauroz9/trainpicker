@@ -2,4 +2,6 @@
 .env.prod
 data/
 error_renfe.png
-.claude/worktrees/
+respuesta.dwr
+.claude/worktrees/__pycache__/
+*.pyc

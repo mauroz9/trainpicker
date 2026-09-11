@@ -1,8 +1,7 @@
 import asyncio
-import codecs
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from playwright.async_api import Browser, Playwright, async_playwright
@@ -30,139 +29,372 @@ def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
+_IDENT_RE = re.compile(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*:")
+_BLOCK_MARKER = "acercamientoViajeDestino:"
+# Señales que deciden si un tren es comprable. Si ninguna aparece en el
+# itinerario, asumimos que Renfe cambio el formato del DWR (fail-closed).
+_AVAILABILITY_FIELDS = ("completo", "tarifasDisponibles", "razonNoDisponible", "soloPlazaH")
+
+
 def _decode_escaped_text(value: str) -> str:
-    return codecs.decode(value, "unicode_escape")
+    """Convierte los escapes `\\uXXXX` / `\\xXX` del DWR en caracteres reales.
 
-def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
+    Antes se usaba `codecs.decode(value, "unicode_escape")`, que ademas de
+    resolver los escapes reinterpreta el texto byte a byte: si la respuesta ya
+    venia decodificada (httpx decodifica el cuerpo segun el charset), "EL
+    PUERTO DE SANTA MARIA" con tilde salia convertido en mojibake
+    ("MARÃ\\x8dA"). Esos nombres corruptos no son solo cosmeticos: `main.py`
+    los guarda como origen/destino de la alerta y `scheduler.py` los reescribe
+    en el autocompletado de Renfe al recapturar la sesion.
+
+    Sustituyendo solo los escapes se cubre el caso en que Renfe escapa el
+    texto y se deja intacto el que ya viene decodificado.
     """
-    Parsea la respuesta DWR de Renfe.
+    def _replace(match: "re.Match[str]") -> str:
+        return chr(int(match.group(1) or match.group(2), 16))
 
-    Disponibilidad: parte de la logica real que usa el propio frontend de
-    Renfe (`listaTrenes.js`, funcion que decide entre las plantillas
-    `trenTemplateCompleto` / `trenTemplateBloqueado` / `trenTemplateNoCircula`
-    / `trenTemplateNoVenta`) para decidir si un tren es comprable, mas una
-    restriccion adicional de negocio propia de TrainPicker. Un tren se
-    considera NO disponible si se cumple cualquiera de:
+    try:
+        return _UNICODE_ESCAPE_RE.sub(_replace, value)
+    except Exception:
+        return value
+
+
+def _skip_string(text: str, index: int) -> int:
+    quote = text[index]
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            return index + 1
+        index += 1
+    return index
+
+
+def _skip_nested(text: str, index: int) -> int:
+    """Devuelve el indice justo despues del `[`/`{` balanceado que abre en `index`."""
+    depth = 0
+    while index < len(text):
+        char = text[index]
+        if char in "\"'":
+            index = _skip_string(text, index)
+            continue
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return index
+
+
+def _extract_object_fields(text: str, start: int) -> Tuple[Dict[str, str], int]:
+    """Extrae los campos del objeto que empieza en `start`, sin entrar en los anidados.
+
+    `start` apunta al valor de `acercamientoViajeDestino`, es decir, al interior
+    del objeto del itinerario. Se leen sus campos hasta el `}` que lo cierra;
+    todo objeto o array anidado (tarifas, tramos de un enlace) se salta entero,
+    de forma que nunca aporta un `completo:`/`horaSalida:`/`fecha:` que no le
+    corresponde al itinerario. Los valores se devuelven crudos (`"3"`, `null`,
+    `true`, `[`), tal cual aparecen en el DWR.
+
+    Devuelve tambien el indice donde se encontro el `}` de cierre (o `len(text)`
+    si no aparecio), para que el llamante pueda acotar una busqueda propia
+    dentro del objeto completo, anidados incluidos (ver `_codigos_tren_tramo`).
+    """
+    fields: Dict[str, str] = {}
+    index = start
+    length = len(text)
+
+    while index < length:
+        char = text[index]
+
+        if char in "\"'":
+            index = _skip_string(text, index)
+            continue
+        if char in "[{":
+            index = _skip_nested(text, index)
+            continue
+        if char in "]}":
+            break
+
+        match = _IDENT_RE.match(text, index)
+        if not match:
+            index += 1
+            continue
+
+        name = match.group(1)
+        value_start = match.end()
+        while value_start < length and text[value_start] in " \t\r\n":
+            value_start += 1
+
+        if value_start >= length:
+            break
+
+        if text[value_start] in "\"'":
+            value_end = _skip_string(text, value_start)
+            raw = text[value_start:value_end]
+        elif text[value_start] in "[{":
+            raw = text[value_start]
+            value_end = _skip_nested(text, value_start)
+        else:
+            value_end = value_start
+            while value_end < length and text[value_end] not in ",}])":
+                value_end += 1
+            raw = text[value_start:value_end].strip()
+
+        fields.setdefault(name, raw)
+        index = value_end
+
+    return fields, index
+
+
+_LEG_TREN_RE = re.compile(r'cdgoTren:"([^"]*)"')
+
+
+def _codigos_tren_tramo(texto_dwr: str, start: int, end: int) -> str:
+    """Codigo(s) de tren real(es) del itinerario que ocupa `[start, end)`.
+
+    `cdgoTren` no es un campo propio del itinerario (que `_extract_object_fields`
+    ignoraria, al vivir anidado en `trayectos`), sino de cada tramo dentro de
+    `trayectos: [...]`; un itinerario directo tiene un tramo (un cdgoTren), un
+    enlace varios. Es el unico identificador real del tren fisico que trae el
+    DWR: dos itinerarios pueden compartir salida/llegada/origen/destino siendo
+    trenes distintos (p.ej. 13083 con plaza y 35083 "Tren Completo" saliendo
+    ambos de San Bernardo a las 18:12 con llegada 19:26, visto en vivo el
+    11/09/2026 para el 13/09/2026), y sin este codigo no hay forma de
+    diferenciarlos: se fundirian por error via el OR de disponibilidad
+    (issue #25). Se buscan dentro de todo el rango del itinerario (tramos
+    incluidos) porque tambien aparece redundado en `tarifasDisponibles`.
+    """
+    return "+".join(sorted(set(_LEG_TREN_RE.findall(texto_dwr, start, end))))
+
+
+def _iter_itinerary_fields(texto_dwr: str) -> List[Dict[str, str]]:
+    """Devuelve los campos de cada itinerario de la respuesta DWR.
+
+    Localiza cada `acercamientoViajeDestino:` anotando a que profundidad de
+    anidamiento aparece y se queda solo con los de profundidad minima: esos son
+    los itinerarios que Renfe lista, mientras que los mas profundos son objetos
+    interiores (p.ej. los tramos de un enlace, que repiten la misma forma). El
+    troceado anterior con `split(marcador)` no distinguia unos de otros, asi que
+    un tramo con plaza libre entraba en el listado como si fuera un tren mas.
+    """
+    occurrences: List[Tuple[int, int]] = []
+    depth = 0
+    index = 0
+    length = len(texto_dwr)
+    marker_length = len(_BLOCK_MARKER)
+
+    while index < length:
+        char = texto_dwr[index]
+
+        if char in "\"'":
+            index = _skip_string(texto_dwr, index)
+            continue
+        if char in "[{":
+            depth += 1
+            index += 1
+            continue
+        if char in "]}":
+            depth -= 1
+            index += 1
+            continue
+        if char == "a" and texto_dwr.startswith(_BLOCK_MARKER, index):
+            occurrences.append((depth, index + marker_length))
+            index += marker_length
+            continue
+
+        index += 1
+
+    if not occurrences:
+        return []
+
+    top_depth = min(depth for depth, _ in occurrences)
+    resultado = []
+    for depth, start in occurrences:
+        if depth != top_depth:
+            continue
+        fields, end = _extract_object_fields(texto_dwr, start)
+        fields["_codigosTrenTramo"] = _codigos_tren_tramo(texto_dwr, start, end)
+        resultado.append(fields)
+    return resultado
+
+
+def _text_field(fields: Dict[str, str], name: str) -> Optional[str]:
+    raw = fields.get(name)
+    if raw is None or raw == "null":
+        return None
+    if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+        return _decode_escaped_text(raw[1:-1])
+    return raw
+
+
+def _bool_field(fields: Dict[str, str], name: str) -> Optional[bool]:
+    raw = fields.get(name)
+    if raw not in ("true", "false"):
+        return None
+    return raw == "true"
+
+
+def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]:
+    """Decide si un itinerario es comprable y, si no lo es, por que.
+
+    Replica la logica real del frontend de Renfe (`listaTrenes.js`, la funcion
+    que elige entre `trenTemplateCompleto` / `trenTemplateBloqueado` /
+    `trenTemplateNoCircula` / `trenTemplateNoVenta`) mas una restriccion de
+    negocio propia de TrainPicker. Un tren NO esta disponible si:
       - `completo == true`.
-      - `razonNoDisponible` esta presente, no vacio y distinto de `"8"`
-        (Renfe usa el codigo "8" solo para incidencias informativas -p.ej.
-        limitaciones de velocidad de Adif- que no bloquean la venta; el resto
-        de codigos observados -"3" completo, "4" trayecto bloqueado, "5"/"6"/
-        "7" no circula- si la bloquean, igual que cualquier codigo nuevo no
-        catalogado, replicando el `else` final de esa misma funcion).
+      - `razonNoDisponible` esta presente, NO es vacio y es distinto de `"8"`.
+        Renfe usa `""` para "sin incidencia" y `"8"` solo para avisos
+        informativos (p.ej. limitaciones de velocidad de Adif) que no bloquean
+        la venta; el resto de codigos observados -"3" completo, "4" trayecto
+        bloqueado, "5"/"6"/"7" no circula- si la bloquean, igual que cualquier
+        codigo nuevo no catalogado (el `else` final de esa misma funcion).
       - `tarifasDisponibles == null` (sin tarifas no hay nada que comprar).
-      - `soloPlazaH == true`: en el frontend de Renfe esto NO bloquea el
-        flujo de compra (solo cambia que plantilla/icono se pinta), pero
-        significa que las unicas plazas que quedan son plazas H, reservadas
-        para personas con movilidad reducida. Un usuario sin esa necesidad
-        no puede comprarlas en la practica, asi que para el caso de uso de
-        TrainPicker (avisar cuando se libera una plaza normal) se trata como
-        tren completo.
-    Ver PR de la tarea #5 para el analisis con datos reales y el volcado del
-    JS de Renfe que respalda esta logica.
+      - `soloPlazaH == true`: en el frontend de Renfe esto NO bloquea la compra
+        (solo cambia que plantilla/icono se pinta), pero significa que las
+        unicas plazas que quedan son plazas H, reservadas para personas con
+        movilidad reducida. Un usuario sin esa necesidad no puede comprarlas en
+        la practica, asi que para el caso de uso de TrainPicker (avisar cuando
+        se libera una plaza normal) se trata como tren completo.
 
     Fail-closed ante roturas de formato: si ninguna de las cuatro señales
-    (`completo`, `tarifasDisponibles`, `razonNoDisponible`, `soloPlazaH`)
-    matchea en un bloque, se asume que Renfe cambio el formato del DWR. En
-    vez de marcar el tren como disponible por defecto (fail-open silencioso,
-    tarea #5), se marca como NO disponible y se loguea un warning explicito
-    para detectar la rotura cuanto antes.
+    aparece, se asume que Renfe cambio el formato del DWR y se marca como NO
+    disponible (en vez de disponible por defecto, tarea #5).
+    """
+    if not any(name in fields for name in _AVAILABILITY_FIELDS):
+        return False, "formato_desconocido"
+
+    motivos: List[str] = []
+
+    if _bool_field(fields, "completo"):
+        motivos.append("completo")
+
+    if fields.get("tarifasDisponibles") == "null":
+        motivos.append("sin_tarifas")
+
+    razon = _text_field(fields, "razonNoDisponible")
+    if razon not in (None, "", "8"):
+        motivos.append("razon_%s" % razon)
+
+    if _bool_field(fields, "soloPlazaH"):
+        motivos.append("solo_plaza_h")
+
+    if not motivos:
+        return True, None
+
+    return False, "+".join(motivos)
+
+
+def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
+    """Parsea la respuesta DWR de Renfe y devuelve los trenes de `date_str`.
+
+    Cada itinerario se identifica por `(codigosTrenTramo, salida, llegada,
+    origen, destino)`, donde `codigosTrenTramo` son los `cdgoTren` reales de
+    `trayectos` (ver `_codigos_tren_tramo`) -el itinerario en si no trae un
+    `cdgoTren` propio, asi que leerlo como campo de primer nivel siempre da
+    `None` y deja la identidad reducida a salida/llegada/origen/destino sin
+    avisar-. Antes se indexaba solo por la hora de salida y se aplicaba un OR
+    de disponibilidad, asi que dos itinerarios distintos que salen a la misma
+    hora -habituales en esta respuesta, que es la de `trainEnlacesManager` y
+    mezcla trenes directos con enlaces y acercamientos- se fundian en uno y la
+    plaza libre de uno marcaba como disponible el que estaba completo (issue
+    #25). Eso incluye pares de trenes reales y distintos con identica salida y
+    llegada nominal (visto en vivo: 13083 con plaza y 35083 "Tren Completo",
+    ambos San Bernardo 18:12 -> Puerto de Santa Maria 19:26 del 13/09/2026). El
+    OR se mantiene, pero solo entre bloques que son literalmente el mismo tren
+    (varias filas de tarifa del mismo itinerario).
 
     Ademas de `disponible` (contrato estable que consumen `main.py` y
-    `scheduler.py`), se exponen campos adicionales del bloque -tren, duracion,
-    precio orientativo, si es directo y disponibilidad por tipo de plaza- para
-    dar contexto mas rico sin romper lo existente.
+    `scheduler.py`), se exponen campos del itinerario -tren, duracion, precio
+    orientativo, si es directo, disponibilidad por tipo de plaza- y `motivo`,
+    que explica por que un tren se ha marcado como no disponible.
     """
-    trenes_unicos: Dict[str, Dict[str, Any]] = {}
+    trenes_unicos: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    fechas_vistas: set = set()
 
     try:
         d, m, y = date_str.split('/')
         target_date = f"{y}-{m}-{d}"
+    except ValueError:
+        logger.error("parsear_dwr_renfe: fecha invalida %r (se espera DD/MM/AAAA)", date_str)
+        return []
 
-        bloques = texto_dwr.split('acercamientoViajeDestino:')
+    itinerarios = _iter_itinerary_fields(texto_dwr)
 
-        for bloque in bloques[1:]:
-            fecha_m = re.search(r'fecha:\s*"([^"]+)"', bloque)
-            if not fecha_m or fecha_m.group(1) != target_date:
+    for fields in itinerarios:
+        try:
+            fecha_itinerario = _text_field(fields, "fecha")
+            fechas_vistas.add(fecha_itinerario)
+            if fecha_itinerario != target_date:
                 continue
 
-            salida_m = re.search(r'horaSalida:\s*"(\d{2}:\d{2})"', bloque)
-            llegada_m = re.search(r'horaLlegada:\s*"(\d{2}:\d{2})"', bloque)
+            salida = _text_field(fields, "horaSalida")
+            llegada = _text_field(fields, "horaLlegada")
+            if not salida or not llegada:
+                continue
 
-            origen_m = re.search(r'descripcionEstacionOrigen:\s*"([^"]+)"', bloque)
-            destino_m = re.search(r'descripcionEstacionDestino:\s*"([^"]+)"', bloque)
+            origen_real = _text_field(fields, "descripcionEstacionOrigen") or ""
+            destino_real = _text_field(fields, "descripcionEstacionDestino") or ""
+            codigo_tren = fields.get("_codigosTrenTramo") or None
 
-            completo_m = re.search(r'completo:\s*(true|false)', bloque)
-            tarifas_m = re.search(r'tarifasDisponibles:\s*(null|\[)', bloque)
-            razon_m = re.search(r'razonNoDisponible:\s*(null|"[^"]*")', bloque)
-            solo_plazah_m = re.search(r'soloPlazaH:\s*(true|false)', bloque)
+            disponible, motivo = evaluar_disponibilidad(fields)
 
-            tren_m = re.search(r'cdgoTren:\s*"([^"]*)"', bloque)
-            duracion_m = re.search(r'duracionViaje:\s*"([^"]*)"', bloque)
-            precio_m = re.search(r'tarifaMinima:\s*(null|"[^"]*")', bloque)
-            directo_m = re.search(r'directo:\s*(true|false)', bloque)
-            plaza_h_m = re.search(r'plazaHDisponible:\s*(true|false)', bloque)
-            plaza_b_m = re.search(r'plazaBDisponible:\s*(true|false)', bloque)
+            if motivo == "formato_desconocido":
+                logger.warning(
+                    "parsear_dwr_renfe: no se encontro ninguna señal de disponibilidad "
+                    "(completo/tarifasDisponibles/razonNoDisponible/soloPlazaH) para el "
+                    "tren %s (salida %s, %s). Renfe pudo cambiar el formato del DWR; se "
+                    "marca como no disponible por seguridad.",
+                    codigo_tren or "?", salida, target_date,
+                )
 
-            if salida_m and llegada_m:
-                salida = salida_m.group(1)
-                llegada = llegada_m.group(1)
+            tren_data = {
+                "salida": salida,
+                "llegada": llegada,
+                "origen": origen_real.title(),
+                "destino": destino_real.title(),
+                "disponible": disponible,
+                "motivo": motivo,
+                "tren": codigo_tren,
+                "duracion": _text_field(fields, "duracionViaje"),
+                "precio_desde": _text_field(fields, "tarifaMinima"),
+                "directo": _bool_field(fields, "directo"),
+                "plaza_h_disponible": _bool_field(fields, "plazaHDisponible"),
+                "plaza_b_disponible": _bool_field(fields, "plazaBDisponible"),
+            }
 
-                origen_real = _decode_escaped_text(origen_m.group(1)) if origen_m else ""
-                destino_real = _decode_escaped_text(destino_m.group(1)) if destino_m else ""
+            identidad = (codigo_tren or "", salida, llegada, origen_real, destino_real)
+            existente = trenes_unicos.get(identidad)
 
-                if not (completo_m or tarifas_m or razon_m or solo_plazah_m):
-                    logger.warning(
-                        "parsear_dwr_renfe: no se encontro ninguna señal de disponibilidad "
-                        "(completo/tarifasDisponibles/razonNoDisponible/soloPlazaH) para el "
-                        "tren %s (salida %s, %s). Renfe pudo cambiar el formato del DWR; se "
-                        "marca como no disponible por seguridad.",
-                        tren_m.group(1) if tren_m else "?", salida, target_date,
-                    )
-                    is_full = True
-                else:
-                    is_full = False
+            if existente is None:
+                trenes_unicos[identidad] = tren_data
+            elif tren_data["disponible"] and not existente["disponible"]:
+                existente["disponible"] = True
+                existente["motivo"] = None
 
-                    if completo_m and completo_m.group(1) == 'true':
-                        is_full = True
+        except Exception as e:
+            logger.exception("Error parseando un itinerario del DWR: %s", e)
 
-                    if tarifas_m and tarifas_m.group(1) == 'null':
-                        is_full = True
+    if itinerarios and not trenes_unicos:
+        # Renfe respondio con itinerarios pero ninguno es de la fecha pedida.
+        # Puede ser normal (no hay trenes ese dia), pero tambien seria el
+        # sintoma de que `fecha` ha dejado de ser un campo del itinerario: en
+        # ese caso el bot diria "no se han encontrado trenes" para todo, en
+        # silencio. Se deja rastro con las fechas que si venian.
+        logger.warning(
+            "parsear_dwr_renfe: %s itinerarios en la respuesta y ninguno para %s "
+            "(fechas encontradas: %s)",
+            len(itinerarios), target_date,
+            ", ".join(sorted(f for f in fechas_vistas if f)) or "ninguna",
+        )
 
-                    if razon_m and razon_m.group(1) not in ('null', '"8"'):
-                        is_full = True
-
-                    if solo_plazah_m and solo_plazah_m.group(1) == 'true':
-                        is_full = True
-
-                tren_data = {
-                    "salida": salida,
-                    "llegada": llegada,
-                    "origen": origen_real.title(),
-                    "destino": destino_real.title(),
-                    "disponible": not is_full,
-                    "tren": tren_m.group(1) if tren_m else None,
-                    "duracion": duracion_m.group(1) if duracion_m else None,
-                    "precio_desde": precio_m.group(1).strip('"') if precio_m and precio_m.group(1) != 'null' else None,
-                    "directo": directo_m.group(1) == 'true' if directo_m else None,
-                    "plaza_h_disponible": plaza_h_m.group(1) == 'true' if plaza_h_m else None,
-                    "plaza_b_disponible": plaza_b_m.group(1) == 'true' if plaza_b_m else None,
-                }
-
-                existente = trenes_unicos.get(salida)
-                if existente is None or (not existente["disponible"] and tren_data["disponible"]):
-                    trenes_unicos[salida] = tren_data
-                elif tren_data["disponible"]:
-                    existente["disponible"] = True
-
-        trains_found = list(trenes_unicos.values())
-        trains_found = sorted(trains_found, key=lambda x: x['salida'])
-
-        return trains_found
-
-    except Exception as e:
-        logger.exception("Error parseando el DWR: %s", e)
-        return []
+    return sorted(trenes_unicos.values(), key=lambda tren: (tren["salida"], tren["llegada"]))
 
 
 async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional[List[Dict[str, Any]]]:

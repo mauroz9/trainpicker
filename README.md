@@ -102,7 +102,10 @@ renfe-bot/
 ├── Dockerfile              # Imagen Docker personalizada
 ├── scripts/
 │   ├── release.sh          # Build + tag + push a GitLab Container Registry (bash)
-│   └── release.ps1         # Igual que release.sh, para Windows/PowerShell
+│   ├── release.ps1         # Igual que release.sh, para Windows/PowerShell
+│   └── diagnosticar_dwr.py # Vuelca cómo se interpreta una respuesta DWR de Renfe
+├── tests/                  # Tests de regresión del parseo (sin red, stdlib)
+├── docs/                   # Notas de investigación de bugs concretos
 ├── requirements.txt        # Dependencias Python
 ├── .env.example            # Plantilla de variables de entorno (desarrollo)
 ├── .env.prod.example       # Plantilla de variables de entorno (producción)
@@ -175,6 +178,25 @@ volumes:
 2. Crea la carpeta si no existe:
 ```bash
 mkdir data
+```
+
+## 🧪 Tests
+
+Los tests cubren la traducción de la respuesta DWR de Renfe a la lista de
+trenes (disponibilidad, identidad del tren, decodificación de las estaciones).
+No hacen ninguna llamada de red y solo usan la librería estándar:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Si un tren aparece con un estado que no cuadra con lo que muestra la web de
+Renfe, guarda la respuesta cruda de `getTrainsList.dwr` (DevTools → Red →
+"Copiar respuesta") y pásasela al diagnosticador, que imprime las señales
+crudas y la decisión tomada para cada itinerario:
+
+```bash
+python3 scripts/diagnosticar_dwr.py respuesta.dwr 13/09/2026 --salida 18:12
 ```
 
 ## 📦 Dependencias

@@ -61,6 +61,28 @@ def _group_alerts(alerts) -> GroupedAlerts:
     return grouped_searches
 
 
+def _alert_matches_train(user_data: WaitingUser, tren_web: Dict[str, Any]) -> bool:
+    """Comprueba que el tren libre es exactamente el que vigila la alerta.
+
+    Antes se comparaba solo la hora de salida, pero la respuesta de Renfe
+    (`trainEnlacesManager`) mezcla directos, enlaces y acercamientos: varios
+    itinerarios distintos pueden salir a la misma hora, y bastaba con que uno
+    tuviera plaza para disparar el aviso del que estaba completo (issue #25).
+    Se compara tambien la hora de llegada, que ya se guarda en la tabla
+    `alerts`; las alertas antiguas con `arrival_time` vacio siguen casando solo
+    por salida para no dejarlas huerfanas.
+    """
+    if user_data['train_time'] != tren_web.get('salida'):
+        return False
+
+    arrival_time = user_data.get('arrival_time')
+    llegada_web = tren_web.get('llegada')
+    if arrival_time and llegada_web and arrival_time != llegada_web:
+        return False
+
+    return True
+
+
 async def _notify_users_for_route(
     bot: Bot,
     origin: str,
@@ -77,7 +99,7 @@ async def _notify_users_for_route(
             continue
 
         for user_data in users_waiting:
-            if user_data['train_time'] != tren_web.get('salida'):
+            if not _alert_matches_train(user_data, tren_web):
                 continue
 
             mensaje = (
