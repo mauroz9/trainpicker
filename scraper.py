@@ -92,7 +92,7 @@ def _skip_nested(text: str, index: int) -> int:
     return index
 
 
-def _extract_object_fields(text: str, start: int) -> Dict[str, str]:
+def _extract_object_fields(text: str, start: int) -> Tuple[Dict[str, str], int]:
     """Extrae los campos del objeto que empieza en `start`, sin entrar en los anidados.
 
     `start` apunta al valor de `acercamientoViajeDestino`, es decir, al interior
@@ -101,6 +101,10 @@ def _extract_object_fields(text: str, start: int) -> Dict[str, str]:
     de forma que nunca aporta un `completo:`/`horaSalida:`/`fecha:` que no le
     corresponde al itinerario. Los valores se devuelven crudos (`"3"`, `null`,
     `true`, `[`), tal cual aparecen en el DWR.
+
+    Devuelve tambien el indice donde se encontro el `}` de cierre (o `len(text)`
+    si no aparecio), para que el llamante pueda acotar una busqueda propia
+    dentro del objeto completo, anidados incluidos (ver `_codigos_tren_tramo`).
     """
     fields: Dict[str, str] = {}
     index = start
@@ -146,7 +150,28 @@ def _extract_object_fields(text: str, start: int) -> Dict[str, str]:
         fields.setdefault(name, raw)
         index = value_end
 
-    return fields
+    return fields, index
+
+
+_LEG_TREN_RE = re.compile(r'cdgoTren:"([^"]*)"')
+
+
+def _codigos_tren_tramo(texto_dwr: str, start: int, end: int) -> str:
+    """Codigo(s) de tren real(es) del itinerario que ocupa `[start, end)`.
+
+    `cdgoTren` no es un campo propio del itinerario (que `_extract_object_fields`
+    ignoraria, al vivir anidado en `trayectos`), sino de cada tramo dentro de
+    `trayectos: [...]`; un itinerario directo tiene un tramo (un cdgoTren), un
+    enlace varios. Es el unico identificador real del tren fisico que trae el
+    DWR: dos itinerarios pueden compartir salida/llegada/origen/destino siendo
+    trenes distintos (p.ej. 13083 con plaza y 35083 "Tren Completo" saliendo
+    ambos de San Bernardo a las 18:12 con llegada 19:26, visto en vivo el
+    11/09/2026 para el 13/09/2026), y sin este codigo no hay forma de
+    diferenciarlos: se fundirian por error via el OR de disponibilidad
+    (issue #25). Se buscan dentro de todo el rango del itinerario (tramos
+    incluidos) porque tambien aparece redundado en `tarifasDisponibles`.
+    """
+    return "+".join(sorted(set(_LEG_TREN_RE.findall(texto_dwr, start, end))))
 
 
 def _iter_itinerary_fields(texto_dwr: str) -> List[Dict[str, str]]:
@@ -190,11 +215,14 @@ def _iter_itinerary_fields(texto_dwr: str) -> List[Dict[str, str]]:
         return []
 
     top_depth = min(depth for depth, _ in occurrences)
-    return [
-        _extract_object_fields(texto_dwr, start)
-        for depth, start in occurrences
-        if depth == top_depth
-    ]
+    resultado = []
+    for depth, start in occurrences:
+        if depth != top_depth:
+            continue
+        fields, end = _extract_object_fields(texto_dwr, start)
+        fields["_codigosTrenTramo"] = _codigos_tren_tramo(texto_dwr, start, end)
+        resultado.append(fields)
+    return resultado
 
 
 def _text_field(fields: Dict[str, str], name: str) -> Optional[str]:
@@ -266,14 +294,21 @@ def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]
 def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
     """Parsea la respuesta DWR de Renfe y devuelve los trenes de `date_str`.
 
-    Cada itinerario se identifica por `(cdgoTren, salida, llegada, origen,
-    destino)`. Antes se indexaba solo por la hora de salida y se aplicaba un OR
+    Cada itinerario se identifica por `(codigosTrenTramo, salida, llegada,
+    origen, destino)`, donde `codigosTrenTramo` son los `cdgoTren` reales de
+    `trayectos` (ver `_codigos_tren_tramo`) -el itinerario en si no trae un
+    `cdgoTren` propio, asi que leerlo como campo de primer nivel siempre da
+    `None` y deja la identidad reducida a salida/llegada/origen/destino sin
+    avisar-. Antes se indexaba solo por la hora de salida y se aplicaba un OR
     de disponibilidad, asi que dos itinerarios distintos que salen a la misma
     hora -habituales en esta respuesta, que es la de `trainEnlacesManager` y
     mezcla trenes directos con enlaces y acercamientos- se fundian en uno y la
     plaza libre de uno marcaba como disponible el que estaba completo (issue
-    #25). El OR se mantiene, pero solo entre bloques que son literalmente el
-    mismo tren (varias filas de tarifa del mismo itinerario).
+    #25). Eso incluye pares de trenes reales y distintos con identica salida y
+    llegada nominal (visto en vivo: 13083 con plaza y 35083 "Tren Completo",
+    ambos San Bernardo 18:12 -> Puerto de Santa Maria 19:26 del 13/09/2026). El
+    OR se mantiene, pero solo entre bloques que son literalmente el mismo tren
+    (varias filas de tarifa del mismo itinerario).
 
     Ademas de `disponible` (contrato estable que consumen `main.py` y
     `scheduler.py`), se exponen campos del itinerario -tren, duracion, precio
@@ -306,7 +341,7 @@ def parsear_dwr_renfe(texto_dwr: str, date_str: str) -> List[Dict[str, Any]]:
 
             origen_real = _text_field(fields, "descripcionEstacionOrigen") or ""
             destino_real = _text_field(fields, "descripcionEstacionDestino") or ""
-            codigo_tren = _text_field(fields, "cdgoTren")
+            codigo_tren = fields.get("_codigosTrenTramo") or None
 
             disponible, motivo = evaluar_disponibilidad(fields)
 

@@ -54,7 +54,7 @@ def main() -> int:
         disponible, motivo = evaluar_disponibilidad(fields)
         mostrados += 1
 
-        print(f"{salida} - {llegada}  tren={_text_field(fields, 'cdgoTren')}  "
+        print(f"{salida} - {llegada}  tren={fields.get('_codigosTrenTramo') or '<ninguno>'}  "
               f"{_text_field(fields, 'descripcionEstacionOrigen')} -> "
               f"{_text_field(fields, 'descripcionEstacionDestino')}")
         print(f"    disponible={disponible}" + ("" if disponible else f"  motivo={motivo}"))

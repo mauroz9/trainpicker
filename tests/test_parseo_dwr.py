@@ -46,18 +46,28 @@ def itinerario(
 
     Los campos van en orden alfabetico, que es el que usa DWR al serializar el
     bean, y `acercamientoViajeDestino` es por eso el primero: es el marcador con
-    el que `scraper.py` localiza cada itinerario.
+    el que `scraper.py` localiza cada itinerario. `cdgoTren` NO es un campo del
+    itinerario -en la respuesta real vive anidado en `trayectos: [...]`, un
+    objeto por tramo- asi que se serializa ahi, no en el nivel superior; leerlo
+    del nivel superior (como hacia una version anterior de este fixture) daba
+    una falsa sensacion de cobertura, porque `scraper.py` nunca ve ese campo en
+    produccion (ver `_codigos_tren_tramo`, issue #25).
     """
+    trayectos = (
+        ",trayectos:[{cdgoEstacionDestinoTrayecto:\"51400\",cdgoEstacionOrigenTrayecto:\"51100\","
+        f"cdgoProducto:\"X\",cdgoTren:\"{cdgo_tren}\",horaLlegada:\"{hora_llegada}:00\","
+        f"horaSalida:\"{hora_salida}:00\",razonNoDisponible:{razon_no_disponible},tipoTren:\"MD\"}}]"
+    )
     return (
         "{acercamientoViajeDestino:null,acercamientoViajeOrigen:null,"
-        f"cdgoTren:\"{cdgo_tren}\",completo:{completo},"
+        f"completo:{completo},"
         f"descripcionEstacionDestino:\"{destino}\","
         f"descripcionEstacionOrigen:\"{origen}\","
         f"directo:{directo},duracionViaje:\"1:14\",fecha:\"{fecha}\","
         f"horaLlegada:\"{hora_llegada}\",horaSalida:\"{hora_salida}\","
         "plazaBDisponible:true,plazaHDisponible:false,"
         f"razonNoDisponible:{razon_no_disponible},soloPlazaH:{solo_plaza_h},"
-        f"tarifaMinima:{tarifa_minima},tarifasDisponibles:{tarifas}{extra}}}"
+        f"tarifaMinima:{tarifa_minima},tarifasDisponibles:{tarifas}{trayectos}{extra}}}"
     )
 
 
@@ -139,6 +149,29 @@ class TestFalsoPositivoIssue25(unittest.TestCase):
         self.assertEqual(len(trenes), 1)
         self.assertTrue(trenes[0]["disponible"])
         self.assertIsNone(trenes[0]["motivo"])
+
+    def test_dos_trenes_reales_en_la_misma_franja_no_se_funden(self):
+        # Verificado en vivo el 11/09/2026 contra Renfe (San Bernardo -> Puerto
+        # de Santa Maria, 13/09/2026): el tren 13083 (con plaza) y el 35083
+        # ("Tren Completo") salen ambos a las 18:12 y llegan a las 19:26. Antes
+        # de leer `cdgoTren` desde `trayectos` (ver `_codigos_tren_tramo`),
+        # `codigo_tren` era siempre `None` para los dos, la identidad se
+        # reducia a salida/llegada/origen/destino y el OR de disponibilidad
+        # fundia ambos en un unico tren "disponible", perdiendo que 35083
+        # esta completo.
+        texto = respuesta_dwr(
+            itinerario(cdgo_tren="13083"),
+            itinerario(
+                cdgo_tren="35083", completo="true", razon_no_disponible='"3"',
+                tarifas="null", tarifa_minima="null",
+            ),
+        )
+
+        trenes = parsear_dwr_renfe(texto, FECHA)
+
+        self.assertEqual(len(trenes), 2, "13083 y 35083 son trenes reales distintos")
+        por_tren = {t["tren"]: t["disponible"] for t in trenes}
+        self.assertEqual(por_tren, {"13083": True, "35083": False})
 
 
 class TestSenalesDeDisponibilidad(unittest.TestCase):

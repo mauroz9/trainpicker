@@ -5,29 +5,22 @@ Notas de la investigación del bug reportado: la web de Renfe muestra
 **18:12 (llegada 19:26)** del **13/09/2026** en el trayecto **San Bernardo →
 Puerto de Santa María**, y TrainPicker lo marca como disponible.
 
-## 0. Limitación de esta investigación
+## 0. Limitación de esta investigación (superada — ver §6)
 
-**No se pudo consultar Renfe en vivo.** La sesión desde la que se hizo este
-trabajo tiene la salida a `www.renfe.com` bloqueada por política de red (el
-proxy de egress responde `403` al `CONNECT`), así que no fue posible capturar
-la respuesta real de `getTrainsList.dwr` para esa fecha ni ejecutar Playwright
-contra la web.
+La primera pasada de esta investigación **no pudo consultar Renfe en vivo**:
+la sesión desde la que se hizo tenía la salida a `www.renfe.com` bloqueada por
+política de red (el proxy de egress respondía `403` al `CONNECT`), así que no
+fue posible capturar la respuesta real de `getTrainsList.dwr` ni ejecutar
+Playwright contra la web. Se trabajó con payloads DWR **reconstruidos** (con
+los nombres de campo reales que ya usa el scraper) y tests de regresión sobre
+esos payloads.
 
-Qué se hizo en su lugar:
-
-- Análisis estático de `parsear_dwr_renfe` y del flujo completo de la alerta.
-- Reproducción del fallo con payloads DWR **reconstruidos** con los nombres de
-  campo reales que ya usa el scraper (los capturó el autor en `8c6b853` y se
-  ampliaron en el PR #16, donde se volcó además el `listaTrenes.js` real de
-  Renfe con su lógica de decisión).
-- Tests de regresión que fijan el comportamiento correcto (`tests/`).
-- Un diagnosticador (`scripts/diagnosticar_dwr.py`) para que la verificación
-  contra la respuesta real sea un solo comando desde una máquina con acceso.
-
-Por tanto: **las causas están demostradas sobre el código** (cada una reproduce
-el síntoma exacto), pero *cuál* de ellas es la que dispara el caso concreto de
-las 18:12 solo puede confirmarlo el volcado real. La verificación pendiente
-está al final.
+Una sesión posterior (11/09/2026, ver §6) sí tuvo acceso y verificó contra
+Renfe real: las causas 2.2-2.5 se confirmaron correctas tal cual, y 2.1 se
+confirmó real pero con un matiz — el mecanismo de identidad por `cdgoTren` que
+la primera pasada diseñó y probó **no funcionaba en producción** porque ese
+campo no vive donde el fix lo leía. Corregido en la misma sesión de
+verificación; detalle en §6.2.
 
 ## 1. Qué mira el bot y de dónde salen los datos
 
@@ -160,9 +153,16 @@ dice disponible.
   - `_extract_object_fields`: lee los campos del propio objeto y salta entero
     cualquier objeto o array anidado, de modo que ningún campo de un tramo o de
     una tarifa se atribuye al itinerario.
-  - Identidad del tren = `(cdgoTren, salida, llegada, origen, destino)`. El OR
-    de disponibilidad se mantiene, pero solo entre bloques que son literalmente
-    el mismo tren.
+  - Identidad del tren = `(codigosTrenTramo, salida, llegada, origen, destino)`.
+    El OR de disponibilidad se mantiene, pero solo entre bloques que son
+    literalmente el mismo tren. `codigosTrenTramo` sale de `cdgoTren`, que
+    **no** es un campo del itinerario sino de cada tramo dentro de
+    `trayectos: [...]` (descubierto en la verificación en vivo, ver §6):
+    leerlo como campo de primer nivel (como hacía la primera versión de este
+    fix) da siempre `None`, y la identidad se queda reducida a
+    `(salida, llegada, origen, destino)` sin avisar. `_codigos_tren_tramo`
+    busca `cdgoTren:"..."` dentro del rango completo del itinerario (tramos
+    incluidos) para no depender de descender explícitamente en la estructura.
   - `evaluar_disponibilidad` extraída y alineada con `listaTrenes.js`: `""`,
     `null` y `"8"` no bloquean; cualquier otro código sí. Se conserva
     `soloPlazaH` como completo (restricción de negocio de TrainPicker) y el
@@ -251,27 +251,111 @@ alerta guardada en 18:12-19:26,
 | Se libera el directo 18:12-19:26 | **sí** |
 | Todo completo | no |
 
-## 6. Verificación pendiente (requiere acceso a Renfe)
+## 6. Verificación en vivo (11/09/2026, contra Renfe real)
 
-1. Buscar San Bernardo → Puerto de Santa María para el 13/09/2026 en
-   renfe.com, DevTools → Red → filtrar `getTrainsList.dwr` → "Copiar
-   respuesta" → guardarla en `respuesta.dwr`.
-2. Ejecutar:
+Hecha con Playwright vía el propio `scraper.refresh_session` (espiando
+`parsear_dwr_renfe` para volcar el texto crudo) y comparada a mano con
+`venta.renfe.com`. Fecha real de la verificación: **11/09/2026**, dos días
+antes del 13/09/2026 que reporta la issue.
 
-   ```bash
-   python3 scripts/diagnosticar_dwr.py respuesta.dwr 13/09/2026 --salida 18:12
-   ```
+### 6.1 El caso literal de la issue ya no se reproduce tal cual
 
-3. Comprobar que el itinerario 18:12-19:26 sale con `disponible=False` y qué
-   `motivo` da, y ver cuántos itinerarios más comparten la salida de las 18:12
-   (que es lo que confirmaría 2.1 como causa concreta de este caso).
+El 18:12-19:26 de San Bernardo → Puerto de Santa María del 13/09/2026 **ya no
+sale como "solo completo, sin alternativa"**: la web muestra ahora **dos**
+tarjetas para ese mismo horario nominal —
 
-Si el itinerario 18:12-19:26 apareciese ahí con todas las señales en "libre"
-(`completo=false`, `tarifasDisponibles=[`, `razonNoDisponible` vacío/nulo/`8`,
-`soloPlazaH=false`) mientras la web lo pinta completo, entonces la causa sería
-otra distinta: que Renfe decide el "Tren completo" con información que no está
-en esta respuesta. En ese caso, el volcado del diagnosticador es exactamente lo
-que hace falta para abrir el siguiente issue.
+- **Tren 13083**: reservable, 12,70 €, con las condiciones de tarifa reales
+  (confirmado haciendo clic en la tarjeta y viendo la ficha de compra: "Adulto
+  ida 12,7€ / Cambios 0% primer cambio, siguientes 10% / Anulaciones 15%").
+- **Tren 35083**: `railway_alert Tren Completo`.
+
+Esto es esperable: la disponibilidad de Renfe es inventario en tiempo real y
+la issue se reportó bastante antes del vuelo. El caso instructivo para la
+verificación no es "¿el bot dice False?" (ahora sí habría un asiento real
+comprable en ese horario), sino **si el bot pierde el hecho de que 35083 sigue
+completo al fundirlo con 13083**, que es justo el mecanismo que describe 2.1.
+
+### 6.2 2.1 confirmada con datos reales — y un hallazgo nuevo: `cdgoTren` no existe donde el fix lo buscaba
+
+`scripts/diagnosticar_dwr.py respuesta.dwr 13/09/2026 --salida 18:12` mostró,
+antes de esta sesión, **dos itinerarios reales** en 18:12-19:26 (`tren=None`
+en ambos):
+
+```
+18:12 - 19:26  tren=None  SAN BERNARDO -> PUERTO DE SANTA MARÍA
+    disponible=True
+    señales: completo=false, tarifasDisponibles=[, razonNoDisponible="8", soloPlazaH=false
+
+18:12 - 19:26  tren=None  SAN BERNARDO -> PUERTO DE SANTA MARÍA
+    disponible=False  motivo=sin_tarifas+razon_3
+    señales: completo=false, tarifasDisponibles=null, razonNoDisponible="3", soloPlazaH=false
+```
+
+`parsear_dwr_renfe` los fundía en una sola entrada `disponible=True` — el
+mecanismo de 2.1 reproducido letra por letra con datos reales, solo que hoy la
+fusión "acierta" (13083 sí tiene hueco) en vez de ocultar un completo sin
+alternativa. El `tren=None` en los dos es la pista: **`cdgoTren` no es un
+campo del itinerario**. Inspeccionando el bloque crudo completo (no solo los
+campos de primer nivel que lee `_extract_object_fields`), aparece anidado
+dentro de `trayectos`:
+
+```
+...tarifasDisponibles:[{...,tarifaTramoCombViewBean:[{...,cdgoTren:"13083",...}],...}],
+...trayectos:[{...,cdgoTren:"13083",...,razonNoDisponible:null,...}],...
+```
+
+para el itinerario disponible, y `trayectos:[{...,cdgoTren:"35083",...,
+razonNoDisponible:"3",...}]` para el completo. **Son dos trenes reales y
+distintos** (13083 y 35083) que casualmente comparten horario nominal — no
+"el mismo tren en dos filas de tarifa". Pero como `_extract_object_fields`
+descarta a propósito el contenido de arrays/objetos anidados (es la defensa de
+2.2 contra los tramos fantasma: solo guarda el primer carácter `[`/`{` y
+salta el resto), `_text_field(fields, "cdgoTren")` devolvía `None` **siempre**,
+en producción, para cualquier itinerario real. La identidad quedaba reducida a
+`(salida, llegada, origen, destino)` — exactamente la misma agrupación que
+antes del fix — y el `cdgoTren` de la identidad documentada en el código y
+probado en `tests/test_parseo_dwr.py` (que lo serializaba en el nivel
+superior del itinerario, no anidado) nunca se ejercitó contra una forma real
+de la respuesta.
+
+**Corregido en esta sesión** (`scraper.py`): `_extract_object_fields` ahora
+también devuelve dónde cierra el objeto del itinerario, y
+`_codigos_tren_tramo` busca `cdgoTren:"..."` en todo ese rango (tramos
+incluidos, para que un enlace multi-tramo componga su identidad con todos los
+trenes que lo forman). `codigo_tren` deja de leer el campo de primer nivel
+inexistente y pasa a usar esto. Verificado contra la misma respuesta real:
+
+```
+18:12 - 19:26  tren=13083  ...  disponible=True
+18:12 - 19:26  tren=35083  ...  disponible=False  motivo=sin_tarifas+razon_3
+```
+
+Ahora se listan por separado, cada uno con su disponibilidad real. Mismo
+patrón confirmado en 20:53 (13035 con hueco + 35035 completo) y 22:13 (13073
+con hueco + 35073 completo) de la misma respuesta.
+
+`tests/test_parseo_dwr.py` se actualizó en dos frentes: el fixture
+`itinerario()` ahora serializa `cdgoTren` anidado en `trayectos` (como hace
+Renfe de verdad, no en el nivel superior) y se añadió
+`test_dos_trenes_reales_en_la_misma_franja_no_se_funden`, que reproduce
+literalmente el par 13083/35083 visto en vivo como test de regresión con
+datos auténticos (anonimizado: son los códigos de tren reales, sin datos de
+usuario).
+
+### 6.3 Resto del listado
+
+El resto de horarios del 13/09/2026 San Bernardo → Puerto de Santa María
+cuadra con la web tren a tren: `disponible=True` con precio y ambas plazas
+cuando la web ofrece tarifa; `disponible=False, motivo=solo_plaza_h` cuando la
+web marca "Solo plaza H disponible" (la restricción de negocio deliberada de
+TrainPicker, sin tocar). No se encontraron itinerarios con
+`motivo=formato_desconocido` (fail-closed de 2.3) ni trenes fantasma (2.2) en
+ninguna de las capturas.
+
+### 6.4 Backlog: vinculado al Project
+
+La issue #25 se añadió al GitHub Project 15 (`Tipo=Bug`, `Priority=P0`,
+`Status=In review`) — ver protocolo en `CLAUDE.md`.
 
 ## 7. Hallazgos anotados y NO corregidos aquí
 
