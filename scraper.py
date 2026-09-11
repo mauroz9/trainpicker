@@ -174,6 +174,32 @@ def _codigos_tren_tramo(texto_dwr: str, start: int, end: int) -> str:
     return "+".join(sorted(set(_LEG_TREN_RE.findall(texto_dwr, start, end))))
 
 
+_TARIFA_SOLO_PLAZAS_H_RE = re.compile(r'soloPlazasH:(true|false)')
+
+
+def _tarifa_solo_plaza_reservada(texto_dwr: str, start: int, end: int) -> bool:
+    """True si todas las filas de tarifa ofertadas son de plaza reservada.
+
+    `tarifasDisponibles[].soloPlazasH` (anidado, plural) es la señal real de
+    si la tarifa ofertada esta restringida a un tipo de plaza reservada (H o
+    bicicleta): a pesar del nombre, en la practica no distingue el tipo, solo
+    si la unica plaza que queda es de un cupo reservado. Es distinta -y mas
+    fiable- que `soloPlazaH` (nivel superior, singular), que puede venir en
+    `false` aunque la unica tarifa ofertada sea de plaza bicicleta (verificado
+    en vivo: tren 13083, San Bernardo -> Puerto de Santa Maria, 12 de 794
+    itinerarios reales muestreados en 3 rutas y 21 fechas no tenian ninguna
+    plaza normal a pesar de `soloPlazaH=false`). En los 794 itinerarios
+    muestreados nunca hay filas de tarifa mezcladas (unas restringidas y
+    otras no): o todas lo estan o ninguna, pero por si acaso se exige que
+    *todas* las filas ofertadas lo esten -si hay alguna sin restriccion, hay
+    un asiento normal que reservar y no debe marcarse completo-. Sin ninguna
+    fila de tarifa (tarifasDisponibles: null) devuelve False; ese caso ya lo
+    cubre el motivo `sin_tarifas`.
+    """
+    valores = _TARIFA_SOLO_PLAZAS_H_RE.findall(texto_dwr, start, end)
+    return bool(valores) and all(v == "true" for v in valores)
+
+
 def _iter_itinerary_fields(texto_dwr: str) -> List[Dict[str, str]]:
     """Devuelve los campos de cada itinerario de la respuesta DWR.
 
@@ -221,6 +247,7 @@ def _iter_itinerary_fields(texto_dwr: str) -> List[Dict[str, str]]:
             continue
         fields, end = _extract_object_fields(texto_dwr, start)
         fields["_codigosTrenTramo"] = _codigos_tren_tramo(texto_dwr, start, end)
+        fields["_tarifaSoloPlazaReservada"] = _tarifa_solo_plaza_reservada(texto_dwr, start, end)
         resultado.append(fields)
     return resultado
 
@@ -256,12 +283,20 @@ def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]
         bloqueado, "5"/"6"/"7" no circula- si la bloquean, igual que cualquier
         codigo nuevo no catalogado (el `else` final de esa misma funcion).
       - `tarifasDisponibles == null` (sin tarifas no hay nada que comprar).
-      - `soloPlazaH == true`: en el frontend de Renfe esto NO bloquea la compra
-        (solo cambia que plantilla/icono se pinta), pero significa que las
-        unicas plazas que quedan son plazas H, reservadas para personas con
-        movilidad reducida. Un usuario sin esa necesidad no puede comprarlas en
-        la practica, asi que para el caso de uso de TrainPicker (avisar cuando
-        se libera una plaza normal) se trata como tren completo.
+      - `soloPlazaH == true` (nivel superior) o `tarifasDisponibles[].soloPlazasH
+        == true` en todas las filas de tarifa ofertadas (anidado, ver
+        `_tarifa_solo_plaza_reservada`): en el frontend de Renfe esto NO
+        bloquea la compra (solo cambia que plantilla/icono se pinta), pero
+        significa que las unicas plazas que quedan son reservadas -para
+        personas con movilidad reducida o para viajeros con bicicleta-. Un
+        usuario sin esa necesidad no puede comprarlas en la practica, asi que
+        para el caso de uso de TrainPicker (avisar cuando se libera una plaza
+        normal) se trata como tren completo. Se comprueban las dos señales
+        porque no siempre coinciden: verificado en vivo, `soloPlazaH` de nivel
+        superior puede venir en `false` aunque la unica tarifa ofertada sea de
+        plaza bicicleta (12 de 794 itinerarios reales muestreados en 3 rutas y
+        21 fechas), mientras que el anidado nunca se ha visto en `false`
+        cuando el de nivel superior esta en `true`.
 
     Fail-closed ante roturas de formato: si ninguna de las cuatro señales
     aparece, se asume que Renfe cambio el formato del DWR y se marca como NO
@@ -282,8 +317,8 @@ def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]
     if razon not in (None, "", "8"):
         motivos.append("razon_%s" % razon)
 
-    if _bool_field(fields, "soloPlazaH"):
-        motivos.append("solo_plaza_h")
+    if _bool_field(fields, "soloPlazaH") or fields.get("_tarifaSoloPlazaReservada"):
+        motivos.append("solo_plaza_reservada")
 
     if not motivos:
         return True, None
