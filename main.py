@@ -16,7 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
-from scraper import get_trains
+from scraper import RenfeEnColaError, get_trains
 from database import add_alert, delete_alert, init_db, get_user_alerts
 
 load_dotenv()
@@ -153,9 +153,41 @@ async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_T
     destino = context.user_data['destino']
     
     await update.message.reply_text("⏳ Consultando trenes...")
-    
+
+    async def avisar_cola(estado):
+        """Avisa de que la espera la impone Renfe, no un cuelgue del bot.
+
+        Sin esto el usuario veia "Consultando trenes..." y varios minutos de
+        silencio, y lo normal era que repitiese la busqueda (poniendose otra
+        vez al final de la cola).
+        """
+        detalles = []
+        if estado.get("personas_delante") is not None:
+            detalles.append(f"{estado['personas_delante']} personas por delante")
+        if estado.get("minutos") is not None:
+            detalles.append(f"~{estado['minutos']} min estimados")
+        detalle = f" ({', '.join(detalles)})" if detalles else ""
+
+        await update.message.reply_text(
+            f"🚦 *Renfe nos ha puesto en su cola de acceso*{detalle}.\n\n"
+            "Sigo esperando turno, no hace falta que repitas la búsqueda: "
+            "te aviso en cuanto tenga los trenes.",
+            parse_mode='Markdown'
+        )
+
     try:
-        trenes = await get_trains(origen, destino, fecha_str)
+        trenes = await get_trains(origen, destino, fecha_str, on_queue=avisar_cola)
+    except RenfeEnColaError as e:
+        # Renfe mete las busquedas en una sala de espera cuando esta saturada.
+        # No es un problema de la busqueda del usuario, asi que se dice tal cual
+        # en vez de mandarle a revisar los nombres de las estaciones.
+        logger.warning("Renfe en cola virtual al buscar trenes: %s", e)
+        await update.message.reply_text(
+            "⏳ *Renfe tiene ahora mismo cola de acceso* a su web y no nos ha dado turno a tiempo.\n\n"
+            "No es culpa de tu búsqueda. Vuelve a intentarlo en unos minutos.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
     except Exception as e:
         logger.error("Error crítico al buscar trenes: %s", e)
         await update.message.reply_text("❌ Ha ocurrido un problema de conexión con Renfe. Inténtalo de nuevo en unos minutos.")
