@@ -5,12 +5,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from database import build_search_key, delete_session_cache, get_session_cache, upsert_session_cache
 
 logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 AUTOCOMPLETE_TYPE_DELAY_MS = 60
+# Margen para que Renfe confirme la estacion elegida (rellena el hidden de
+# forma asincrona tras el click, no en el propio manejador).
+STATION_CONFIRM_TIMEOUT_MS = 5000
+
+
+class ScraperRenfeError(Exception):
+    """Fallo capturando la sesion de Renfe (distinto de 'no hay trenes')."""
+
+
+class EstacionNoConfirmadaError(ScraperRenfeError):
+    """El autocompletado de Renfe no confirmo la estacion seleccionada."""
+
 
 # Contador de fallos consecutivos de _capture_session_with_playwright. Permite a
 # scheduler.py detectar roturas del scraper (p.ej. Renfe cambia su web) que de
@@ -517,6 +530,54 @@ async def close_browser() -> None:
             _playwright_instance = None
 
 
+async def _seleccionar_estacion(page, campo: str, texto: str) -> None:
+    """Escribe `texto` en el autocompletado `campo` y confirma la sugerencia.
+
+    Hay que CLICAR el `<li>`: Renfe dejo de confirmar la seleccion con
+    ArrowDown+Enter (la sugerencia se queda en `aria-selected="false"`). Sin
+    confirmar, el hidden `cdgoOrigen`/`cdgoDestino` se queda vacio y el boton
+    "Buscar billete" nunca sale de `disabled`, asi que el `click` posterior se
+    quedaba esperando a que se habilitase hasta agotar el timeout: no se
+    llegaba a lanzar ninguna peticion DWR y el bot contestaba "No se han
+    encontrado trenes. Revisa los nombres de las estaciones" para todo.
+
+    Por eso se verifica el hidden despues de clicar: si Renfe vuelve a cambiar
+    el autocompletado, el fallo sale aqui -con nombre- en vez de disfrazarse de
+    busqueda sin resultados medio minuto despues.
+    """
+    selector = f"input#{campo}"
+    opcion = f"#{campo}-awe li[role='option']"
+    hidden = "cdgoOrigen" if campo == "origin" else "cdgoDestino"
+
+    await page.click(selector)
+    await page.fill(selector, "")
+    await page.locator(selector).press_sequentially(texto, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
+    await page.wait_for_selector(opcion, state="visible", timeout=5000)
+    await page.locator(opcion).first.click()
+
+    # Renfe rellena el hidden ~100-500ms DESPUES del click, no dentro del
+    # manejador: leerlo al vuelo devuelve siempre vacio y daria un falso fallo.
+    leer_hidden = (
+        "(name) => { const el = document.querySelector(`input[name=\"${name}\"]`);"
+        " return el ? el.value : ''; }"
+    )
+    try:
+        await page.wait_for_function(
+            f"(name) => {{ const v = ({leer_hidden})(name); return !!v; }}",
+            arg=hidden,
+            timeout=STATION_CONFIRM_TIMEOUT_MS,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise EstacionNoConfirmadaError(
+            f"Renfe no confirmo la estacion {texto!r} en el campo {campo!r}: "
+            f"{hidden} sigue vacio {STATION_CONFIRM_TIMEOUT_MS}ms despues de "
+            f"clicar la sugerencia"
+        ) from exc
+
+    codigo = await page.evaluate(leer_hidden, hidden)
+    logger.debug("Estacion %s confirmada en %s (%s=%s)", texto, campo, hidden, codigo)
+
+
 async def _capture_session_with_playwright(
     origin: str,
     destination: str,
@@ -544,19 +605,8 @@ async def _capture_session_with_playwright(
         except Exception:
             pass
 
-        await page.click("input#origin")
-        await page.fill("input#origin", "")
-        await page.locator("input#origin").press_sequentially(origin, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
-        await page.wait_for_selector("#origin-awe li[role='option']", state="visible", timeout=5000)
-        await page.keyboard.press("ArrowDown")
-        await page.keyboard.press("Enter")
-
-        await page.click("input#destination")
-        await page.fill("input#destination", "")
-        await page.locator("input#destination").press_sequentially(destination, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
-        await page.wait_for_selector("#destination-awe li[role='option']", state="visible", timeout=5000)
-        await page.keyboard.press("ArrowDown")
-        await page.keyboard.press("Enter")
+        await _seleccionar_estacion(page, "origin", origin)
+        await _seleccionar_estacion(page, "destination", destination)
 
         # El radio "solo ida" (label[for='trip-go']) vive dentro del widget de
         # calendario ("lightpick"), que solo se monta/muestra al abrir el
@@ -699,8 +749,14 @@ async def _capture_session_with_playwright(
     except Exception as e:
         _consecutive_capture_failures += 1
         logger.exception("Error durante captura de sesion DWR: %s", e)
-        await page.screenshot(path="error_renfe.png", full_page=True)
-        return []
+        try:
+            await page.screenshot(path="error_renfe.png", full_page=True)
+        except Exception:
+            logger.debug("No se pudo guardar la captura de pantalla del error")
+        # Antes se devolvia [], indistinguible de "no hay trenes": el bot
+        # respondia "Revisa los nombres de las estaciones" aunque el fallo
+        # fuese nuestro. Los llamantes ya capturan.
+        raise
 
     finally:
         await context.close()
