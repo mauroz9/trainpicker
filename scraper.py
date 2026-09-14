@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 from playwright.async_api import Browser, Playwright, async_playwright
@@ -12,13 +12,30 @@ from database import build_search_key, delete_session_cache, get_session_cache, 
 logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 AUTOCOMPLETE_TYPE_DELAY_MS = 60
+
+# Espera normal para que la busqueda dispare la peticion DWR.
+DWR_TIMEOUT_S = 30.0
+# Espera adicional SOLO cuando Renfe nos ha metido en su sala de espera
+# virtual (Queue-it). Ahi no se dispara ninguna peticion hasta que llega
+# nuestro turno, y los turnos observados rondan los 1-3 minutos.
+QUEUE_TIMEOUT_S = 420.0
+QUEUE_HOST = "queue-it.net"
 # Margen para que Renfe confirme la estacion elegida (rellena el hidden de
 # forma asincrona tras el click, no en el propio manejador).
 STATION_CONFIRM_TIMEOUT_MS = 5000
 
 
+# Callback opcional que se invoca (una vez) al detectar la cola virtual, para
+# que quien haya pedido la busqueda pueda avisar al usuario de que toca esperar.
+AvisoColaCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+
+
 class ScraperRenfeError(Exception):
     """Fallo capturando la sesion de Renfe (distinto de 'no hay trenes')."""
+
+
+class RenfeEnColaError(ScraperRenfeError):
+    """Se agoto la espera en la sala de espera virtual de Renfe."""
 
 
 class EstacionNoConfirmadaError(ScraperRenfeError):
@@ -479,6 +496,7 @@ async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional
 
 _playwright_instance: Optional[Playwright] = None
 _browser: Optional[Browser] = None
+_storage_state: Optional[Dict[str, Any]] = None
 _browser_lock: Optional[asyncio.Lock] = None
 
 
@@ -578,19 +596,115 @@ async def _seleccionar_estacion(page, campo: str, texto: str) -> None:
     logger.debug("Estacion %s confirmada en %s (%s=%s)", texto, campo, hidden, codigo)
 
 
+_COLA_PERSONAS_RE = re.compile(r"(\d+)\s*personas?\s*delante", re.IGNORECASE)
+_COLA_MINUTOS_RE = re.compile(r"(\d+)\s*minutos?\s*de\s*tiempo\s*de\s*espera", re.IGNORECASE)
+
+
+async def _leer_estado_cola(page) -> Dict[str, Any]:
+    """Extrae posicion y espera estimada de la pagina de Queue-it.
+
+    Best-effort: es la web de un tercero y solo sirve para dar contexto al
+    usuario, asi que cualquier fallo devuelve los campos a None en vez de
+    romper la captura.
+    """
+    estado: Dict[str, Any] = {"url": page.url, "personas_delante": None, "minutos": None}
+    try:
+        texto = await page.evaluate("() => document.body.innerText")
+    except Exception:
+        return estado
+
+    personas = _COLA_PERSONAS_RE.search(texto)
+    minutos = _COLA_MINUTOS_RE.search(texto)
+    if personas:
+        estado["personas_delante"] = int(personas.group(1))
+    if minutos:
+        estado["minutos"] = int(minutos.group(1))
+    return estado
+
+
+async def _esperar_respuesta_dwr(
+    page,
+    url_keyword: str,
+    lanzar_busqueda,
+    on_queue: Optional[AvisoColaCallback] = None,
+):
+    """Lanza la busqueda y espera la respuesta DWR, tolerando la cola de Renfe.
+
+    Cuando Renfe esta saturada mete la busqueda en una sala de espera virtual
+    (`renfe.queue-it.net`) antes de dejarte llegar a `venta.renfe.com`. Mientras
+    estamos en la cola NO se dispara ninguna peticion DWR, asi que la espera
+    corta vencia y el bot lo reportaba como "no hay trenes". Aqui se espera el
+    turno como un usuario normal: espera corta por defecto y, solo si estamos
+    realmente en la cola, se amplia hasta `QUEUE_TIMEOUT_S`.
+
+    El listener se registra ANTES de lanzar la busqueda para no perder la
+    respuesta si llega muy rapido.
+
+    Si se pasa `on_queue`, se invoca UNA vez al detectar la cola (con la
+    posicion y la espera estimada) para poder avisar al usuario de que la
+    espera es de Renfe y no un cuelgue del bot.
+    """
+    futuro: "asyncio.Future" = asyncio.get_running_loop().create_future()
+
+    def _on_response(response) -> None:
+        if futuro.done():
+            return
+        if url_keyword in response.url and response.status == 200:
+            futuro.set_result(response)
+
+    page.on("response", _on_response)
+    try:
+        await lanzar_busqueda()
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(futuro), timeout=DWR_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            if QUEUE_HOST not in page.url:
+                raise
+
+        estado = await _leer_estado_cola(page)
+        logger.warning(
+            "Renfe nos ha puesto en su cola virtual (%s personas delante, ~%s min). "
+            "Esperando turno hasta %ss",
+            estado["personas_delante"], estado["minutos"], QUEUE_TIMEOUT_S,
+        )
+        if on_queue is not None:
+            # Un aviso fallido (p.ej. Telegram caido) no puede tumbar la captura:
+            # seguimos esperando turno igual.
+            try:
+                await on_queue(estado)
+            except Exception:
+                logger.exception("No se pudo avisar de la cola de Renfe")
+
+        try:
+            return await asyncio.wait_for(asyncio.shield(futuro), timeout=QUEUE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise RenfeEnColaError(
+                f"Seguimos en la cola virtual de Renfe tras {QUEUE_TIMEOUT_S}s ({page.url})"
+            )
+    finally:
+        page.remove_listener("response", _on_response)
+
+
 async def _capture_session_with_playwright(
     origin: str,
     destination: str,
     date_str: str,
     search_key: str,
+    on_queue: Optional[AvisoColaCallback] = None,
 ) -> List[Dict[str, Any]]:
-    global _consecutive_capture_failures
+    global _consecutive_capture_failures, _storage_state
 
     logger.info("Iniciando Playwright para capturar sesion de Renfe")
 
     browser = await _get_browser()
+    # Se reutilizan las cookies de la captura anterior. Ademas de la sesion de
+    # Renfe, eso conserva el pase de la cola virtual (Queue-it da ~20 min de
+    # ventana): con un contexto nuevo por captura haciamos cola otra vez en
+    # CADA ruta que refresca el scheduler.
     context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        storage_state=_storage_state,
     )
     page = await context.new_page()
 
@@ -724,12 +838,14 @@ async def _capture_session_with_playwright(
         logger.info("Interceptando solicitud DWR de trenes")
         url_keyword = "getTrainsList.dwr"
 
-        async with page.expect_response(lambda response: url_keyword in response.url and response.status == 200, timeout=30000) as response_info:
+        async def _lanzar_busqueda() -> None:
             search_button = "button[title='Buscar billete']"
             await page.wait_for_selector(search_button, state="visible", timeout=10000)
             await page.click(search_button)
 
-        api_response = await response_info.value
+        api_response = await _esperar_respuesta_dwr(
+            page, url_keyword, _lanzar_busqueda, on_queue=on_queue
+        )
         texto_dwr = await api_response.text()
 
         api_request = api_response.request
@@ -755,14 +871,23 @@ async def _capture_session_with_playwright(
             logger.debug("No se pudo guardar la captura de pantalla del error")
         # Antes se devolvia [], indistinguible de "no hay trenes": el bot
         # respondia "Revisa los nombres de las estaciones" aunque el fallo
-        # fuese nuestro. Los llamantes ya capturan.
+        # fuese nuestro o la cola de Renfe. Los llamantes ya capturan.
         raise
 
     finally:
+        try:
+            _storage_state = await context.storage_state()
+        except Exception:
+            logger.debug("No se pudo guardar el storage_state del contexto")
         await context.close()
 
 
-async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[str, Any]]:
+async def get_trains(
+    origin: str,
+    destination: str,
+    date_str: str,
+    on_queue: Optional[AvisoColaCallback] = None,
+) -> List[Dict[str, Any]]:
     """Consulta trenes: intenta la sesion cacheada y si falla, cae a Playwright.
 
     Pensada para el flujo de un solo usuario (alta de alerta desde `main.py`),
@@ -771,6 +896,9 @@ async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[
     `get_trains_cached_only` (rapido, sin Playwright) y `refresh_session`
     (Playwright, acotado por semaforo) para no acoplar el intervalo de todas
     las rutas a la mas lenta.
+
+    `on_queue` se invoca si Renfe nos mete en su cola virtual, para poder
+    avisar por Telegram de que la espera puede irse a varios minutos.
     """
     search_key = build_search_key(origin, destination, date_str)
 
@@ -784,7 +912,9 @@ async def get_trains(origin: str, destination: str, date_str: str) -> List[Dict[
         logger.exception("Error en llamada API directa: %s", e)
         delete_session_cache(search_key)
 
-    return await _capture_session_with_playwright(origin, destination, date_str, search_key)
+    return await _capture_session_with_playwright(
+        origin, destination, date_str, search_key, on_queue=on_queue
+    )
 
 
 async def get_trains_cached_only(
