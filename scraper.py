@@ -1,6 +1,9 @@
 import asyncio
+import json
 import logging
+import os
 import re
+import tempfile
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
@@ -23,6 +26,18 @@ QUEUE_HOST = "queue-it.net"
 # Margen para que Renfe confirme la estacion elegida (rellena el hidden de
 # forma asincrona tras el click, no en el propio manejador).
 STATION_CONFIRM_TIMEOUT_MS = 5000
+
+# Cookies de la ultima captura, persistidas en el volumen compartido para que
+# el pase de la cola virtual (Queue-it da ~20 min) y la sesion de Renfe
+# sobrevivan a un reinicio del contenedor: sin esto, cada reinicio empezaba
+# haciendo cola otra vez en la primera ruta.
+STORAGE_STATE_PATH = os.path.join("data", "renfe_storage_state.json")
+# Tope duro al fichero persistido. `storage_state` de Playwright incluye el
+# `localStorage`/`sessionStorage` de cada origen, que puede crecer sin control;
+# como para replicar la sesion solo necesitamos las cookies, se guardan SOLO
+# esas y se descarta el resto. El tope es una red de seguridad extra por si un
+# dia las cookies se disparan: mejor rehacer cola que llenar el disco.
+STORAGE_STATE_MAX_BYTES = 256 * 1024
 
 
 # Callback opcional que se invoca (una vez) al detectar la cola virtual, para
@@ -496,8 +511,77 @@ async def _fetch_with_cached_session(search_key: str, date_str: str) -> Optional
 
 _playwright_instance: Optional[Playwright] = None
 _browser: Optional[Browser] = None
+# Cache en memoria del storage_state; None mientras no se haya cargado ni
+# capturado nada en este proceso (se rellena de disco de forma perezosa).
 _storage_state: Optional[Dict[str, Any]] = None
+_storage_state_loaded: bool = False
 _browser_lock: Optional[asyncio.Lock] = None
+
+
+def _cookies_only(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reduce un storage_state de Playwright a solo sus cookies.
+
+    Descarta `origins` (localStorage/sessionStorage), que es la parte que puede
+    hincharse sin control y que no necesitamos para replicar la sesion.
+    """
+    if not state:
+        return None
+    cookies = state.get("cookies") or []
+    if not cookies:
+        return None
+    return {"cookies": cookies, "origins": []}
+
+
+def _load_storage_state_from_disk() -> Optional[Dict[str, Any]]:
+    """Carga el storage_state persistido, o None si no hay o esta corrupto."""
+    try:
+        with open(STORAGE_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.warning("No se pudo leer %s (%s); se ignora", STORAGE_STATE_PATH, exc)
+        return None
+    return _cookies_only(data)
+
+
+def _persist_storage_state(state: Optional[Dict[str, Any]]) -> None:
+    """Guarda en disco solo las cookies del storage_state, de forma atomica.
+
+    Se aplica el tope `STORAGE_STATE_MAX_BYTES`: si se supera, no se persiste
+    (se prefiere volver a hacer cola a llenar el volumen). Cualquier fallo de
+    E/S es best-effort y no interrumpe la captura.
+    """
+    reducido = _cookies_only(state)
+    if reducido is None:
+        return
+
+    try:
+        payload = json.dumps(reducido, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        logger.debug("storage_state no serializable (%s); no se persiste", exc)
+        return
+
+    if len(payload.encode("utf-8")) > STORAGE_STATE_MAX_BYTES:
+        logger.warning(
+            "storage_state supera %s bytes; no se persiste para no hinchar el volumen",
+            STORAGE_STATE_MAX_BYTES,
+        )
+        return
+
+    try:
+        os.makedirs(os.path.dirname(STORAGE_STATE_PATH) or ".", exist_ok=True)
+        directorio = os.path.dirname(STORAGE_STATE_PATH) or "."
+        fd, tmp = tempfile.mkstemp(dir=directorio, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, STORAGE_STATE_PATH)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except OSError as exc:
+        logger.warning("No se pudo persistir storage_state (%s)", exc)
 
 
 def _get_browser_lock() -> asyncio.Lock:
@@ -693,9 +777,18 @@ async def _capture_session_with_playwright(
     search_key: str,
     on_queue: Optional[AvisoColaCallback] = None,
 ) -> List[Dict[str, Any]]:
-    global _consecutive_capture_failures, _storage_state
+    global _consecutive_capture_failures, _storage_state, _storage_state_loaded
 
     logger.info("Iniciando Playwright para capturar sesion de Renfe")
+
+    # Primera captura del proceso: intenta rehidratar las cookies persistidas
+    # en disco para no volver a hacer cola tras un reinicio del contenedor.
+    if not _storage_state_loaded:
+        _storage_state_loaded = True
+        if _storage_state is None:
+            _storage_state = _load_storage_state_from_disk()
+            if _storage_state:
+                logger.info("storage_state rehidratado desde %s", STORAGE_STATE_PATH)
 
     browser = await _get_browser()
     # Se reutilizan las cookies de la captura anterior. Ademas de la sesion de
@@ -877,6 +970,9 @@ async def _capture_session_with_playwright(
     finally:
         try:
             _storage_state = await context.storage_state()
+            # Persistir en disco (solo cookies, con tope) para que el pase de la
+            # cola sobreviva a un reinicio del contenedor.
+            _persist_storage_state(_storage_state)
         except Exception:
             logger.debug("No se pudo guardar el storage_state del contexto")
         await context.close()

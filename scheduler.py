@@ -8,7 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot
 
 from scraper import build_search_key, close_browser, get_consecutive_capture_failures, get_trains_cached_only, refresh_session
-from database import get_active_alerts, delete_alert, get_session_cache, init_db
+from database import get_active_alerts, delete_alert, get_session_cache, init_db, prune_expired_session_cache
 
 from datetime import datetime
 
@@ -224,6 +224,12 @@ async def refresh_sessions():
     navegadores a la vez. Si la recaptura ya trae plaza libre, notifica al
     instante en vez de esperar al siguiente `fast_check_alerts`.
     """
+    # Recoleccion de basura: sesiones cacheadas de fechas ya pasadas que si no
+    # se irian acumulando en el .db del volumen sin tope.
+    borradas = prune_expired_session_cache()
+    if borradas:
+        logger.info("Podadas %s sesiones cacheadas de fechas pasadas", borradas)
+
     grouped_searches = _get_valid_grouped_alerts()
     if not grouped_searches:
         return
