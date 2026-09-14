@@ -113,6 +113,57 @@ def delete_session_cache(search_key: str) -> None:
         cursor.execute('DELETE FROM session_cache WHERE search_key = ?', (search_key,))
         conn.commit()
 
+
+def prune_expired_session_cache(today: Optional[str] = None) -> int:
+    """Borra las sesiones cacheadas de fechas ya pasadas y devuelve cuantas.
+
+    `session_cache` guarda una fila por (origen, destino, fecha) y, sin esto,
+    las de fechas pasadas nunca se borraban: la tabla crecia sin tope segun se
+    creaban alertas, hinchando el .db del volumen en el servidor. La fecha es
+    el ultimo segmento del `search_key` (`build_search_key` lo compone como
+    `origen-destino-DD/MM/AAAA`), asi que se compara reordenada a AAAAMMDD.
+
+    Las alertas ya expiradas las limpia el scheduler por su lado; esto solo
+    recolecta la basura de sesion que puedan dejar atras.
+    """
+    if today is None:
+        from datetime import datetime
+        today = datetime.now().strftime("%d/%m/%Y")
+
+    def _iso(fecha: str) -> Optional[str]:
+        try:
+            d, m, y = fecha.split("/")
+            return f"{y}{m}{d}"
+        except (ValueError, AttributeError):
+            return None
+
+    hoy_iso = _iso(today)
+    if hoy_iso is None:
+        return 0
+
+    borradas = 0
+    with _get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT search_key FROM session_cache')
+        claves = [row[0] for row in cursor.fetchall()]
+
+        caducadas = []
+        for clave in claves:
+            fecha = clave.rsplit("-", 1)[-1]
+            fecha_iso = _iso(fecha)
+            # Si el search_key no acaba en una fecha parseable, no se toca: es
+            # mejor dejar una fila de mas que borrar algo por un formato que no
+            # entendemos.
+            if fecha_iso is not None and fecha_iso < hoy_iso:
+                caducadas.append(clave)
+
+        for clave in caducadas:
+            cursor.execute('DELETE FROM session_cache WHERE search_key = ?', (clave,))
+            borradas += 1
+        conn.commit()
+
+    return borradas
+
 def add_alert(user_id, origin, destination, date, train_time, arrival_time):
     with _get_connection() as conn:
         cursor = conn.cursor()
