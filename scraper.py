@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import Browser, Playwright, async_playwright
@@ -14,6 +15,13 @@ from database import build_search_key, delete_session_cache, get_session_cache, 
 
 logger = logging.getLogger(__name__)
 ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
+# OneTrust (gestor de cookies de Renfe). Su `OtAutoBlock.js` reescribe a
+# `type="text/plain"` el <script> del catalogo de estaciones
+# (`estacionesEstaticas.js`) hasta que se aceptan cookies, pero Renfe ya no
+# carga el SDK que pinta el banner: no hay boton que aceptar, el catalogo nunca
+# se ejecuta y el autocompletado devuelve "0 resultados" para cualquier
+# estacion. Bloqueando el dominio entero los scripts se ejecutan tal cual.
+BLOCKED_HOSTS = ("cdn.cookielaw.org",)
 AUTOCOMPLETE_TYPE_DELAY_MS = 60
 
 # Espera normal para que la busqueda dispare la peticion DWR.
@@ -26,6 +34,8 @@ QUEUE_HOST = "queue-it.net"
 # Margen para que Renfe confirme la estacion elegida (rellena el hidden de
 # forma asincrona tras el click, no en el propio manejador).
 STATION_CONFIRM_TIMEOUT_MS = 5000
+# Margen para que se ejecute el catalogo de estaciones del autocompletado.
+STATION_CATALOG_TIMEOUT_MS = 10000
 
 # Cookies de la ultima captura, persistidas en el volumen compartido para que
 # el pase de la cola virtual (Queue-it da ~20 min) y la sesion de Renfe
@@ -632,6 +642,15 @@ async def close_browser() -> None:
             _playwright_instance = None
 
 
+async def _filtrar_peticion(route) -> None:
+    """Deja pasar solo los tipos de recurso utiles y nunca los de BLOCKED_HOSTS."""
+    request = route.request
+    if request.resource_type not in ALLOWED_RESOURCE_TYPES or urlparse(request.url).hostname in BLOCKED_HOSTS:
+        await route.abort()
+    else:
+        await route.continue_()
+
+
 async def _seleccionar_estacion(page, campo: str, texto: str) -> None:
     """Escribe `texto` en el autocompletado `campo` y confirma la sugerencia.
 
@@ -801,16 +820,24 @@ async def _capture_session_with_playwright(
     )
     page = await context.new_page()
 
-    await page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ALLOWED_RESOURCE_TYPES else route.abort())
+    await page.route("**/*", _filtrar_peticion)
 
     try:
         logger.info("Buscando trenes: %s -> %s el %s", origin, destination, date_str)
         await page.goto("https://www.renfe.com/es/es", timeout=60000)
 
+        # Sin catalogo, el autocompletado no sugiere nada y el fallo saldria
+        # como un timeout anonimo esperando la sugerencia de la estacion.
         try:
-            await page.click("button#onetrust-accept-btn-handler", timeout=5000)
-        except Exception:
-            pass
+            await page.wait_for_function(
+                "() => (window.estacionesEstatico || []).length > 0",
+                timeout=STATION_CATALOG_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise ScraperRenfeError(
+                "Renfe no cargo el catalogo de estaciones (window.estacionesEstatico "
+                "vacio): el autocompletado no podra sugerir ninguna estacion"
+            ) from exc
 
         await _seleccionar_estacion(page, "origin", origin)
         await _seleccionar_estacion(page, "destination", destination)

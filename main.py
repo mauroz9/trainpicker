@@ -18,11 +18,12 @@ from telegram.ext import (
 
 from scraper import RenfeEnColaError, get_trains
 from database import add_alert, delete_alert, init_db, get_user_alerts
+from log_config import configurar_logging
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+configurar_logging('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 ORIGEN, DESTINO, FECHA = range(3)
