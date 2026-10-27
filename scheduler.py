@@ -9,6 +9,7 @@ from telegram import Bot
 
 from scraper import build_search_key, close_browser, get_consecutive_capture_failures, get_trains_cached_only, refresh_session
 from database import get_active_alerts, delete_alert, get_session_cache, init_db, prune_expired_session_cache
+from log_config import configurar_logging
 
 from datetime import datetime
 
@@ -23,10 +24,7 @@ MAX_CONCURRENT_REFRESHES = int(os.getenv("MAX_CONCURRENT_REFRESHES", "2"))
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 ADMIN_FAILURE_THRESHOLD = int(os.getenv("ADMIN_FAILURE_THRESHOLD", "5"))
 
-logging.basicConfig(
-    format='%(asctime)s - SCHEDULER - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+configurar_logging('%(asctime)s - SCHEDULER - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 if not ADMIN_CHAT_ID:
