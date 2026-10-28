@@ -551,6 +551,26 @@ def _cookies_only(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return {"cookies": cookies, "origins": []}
 
 
+# Cookies de la sesion de servidor de venta.renfe.com. El DWR `getTrainsList`
+# no lista la ruta de sus parametros, sino la del ultimo `buscarTren.do` de esa
+# sesion: si todas las capturas comparten JSESSIONID, la sesion cacheada de
+# cada ruta acaba devolviendo los trenes de la ultima ruta capturada.
+SERVER_SESSION_COOKIES = ("JSESSIONID", "DWRSESSIONID")
+
+
+def _sin_sesion_servidor(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Copia del storage_state sin la sesion de servidor de Renfe.
+
+    Se conserva todo lo demas -en particular las cookies de Queue-it, que son
+    el motivo de reutilizar el storage_state- para que cada captura abra su
+    propia sesion de venta sin volver a hacer cola.
+    """
+    if not state:
+        return state
+    cookies = [c for c in state.get("cookies") or [] if c.get("name") not in SERVER_SESSION_COOKIES]
+    return {**state, "cookies": cookies}
+
+
 def _load_storage_state_from_disk() -> Optional[Dict[str, Any]]:
     """Carga el storage_state persistido, o None si no hay o esta corrupto."""
     try:
@@ -914,10 +934,11 @@ async def _capture_session_with_playwright(
     # Se reutilizan las cookies de la captura anterior. Ademas de la sesion de
     # Renfe, eso conserva el pase de la cola virtual (Queue-it da ~20 min de
     # ventana): con un contexto nuevo por captura haciamos cola otra vez en
-    # CADA ruta que refresca el scheduler.
+    # CADA ruta que refresca el scheduler. La sesion de servidor, en cambio, NO
+    # se reutiliza: ver `SERVER_SESSION_COOKIES`.
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        storage_state=_storage_state,
+        storage_state=_sin_sesion_servidor(_storage_state),
     )
     page = await context.new_page()
 

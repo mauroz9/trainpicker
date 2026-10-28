@@ -131,5 +131,31 @@ class StorageStatePersistenceTest(unittest.TestCase):
         self.assertIsNone(self.scraper._load_storage_state_from_disk())
 
 
+class SinSesionServidorTest(unittest.TestCase):
+    """Cada captura debe abrir su propia sesion de venta (issue #40): el DWR
+    lista la ruta del ultimo `buscarTren.do` de la sesion, asi que compartir
+    JSESSIONID mezclaba los trenes de unas rutas cacheadas con otras."""
+
+    def test_quita_la_sesion_de_servidor_y_conserva_el_pase_de_cola(self):
+        from scraper import _sin_sesion_servidor
+
+        state = {"cookies": [
+            {"name": "JSESSIONID", "domain": "venta.renfe.com"},
+            {"name": "DWRSESSIONID", "domain": "venta.renfe.com"},
+            {"name": "QueueITAccepted-SDFrts345E-V3_volvce", "domain": "venta.renfe.com"},
+            {"name": "Queue-it-01c94c96", "domain": "renfe.queue-it.net"},
+        ], "origins": []}
+
+        nombres = [c["name"] for c in _sin_sesion_servidor(state)["cookies"]]
+
+        self.assertEqual(nombres, ["QueueITAccepted-SDFrts345E-V3_volvce", "Queue-it-01c94c96"])
+        self.assertEqual(len(state["cookies"]), 4, "no debe mutar el storage_state original")
+
+    def test_sin_storage_state_devuelve_none(self):
+        from scraper import _sin_sesion_servidor
+
+        self.assertIsNone(_sin_sesion_servidor(None))
+
+
 if __name__ == "__main__":
     unittest.main()
