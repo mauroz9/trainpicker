@@ -271,8 +271,19 @@ class TestSenalesDeDisponibilidad(unittest.TestCase):
 
     def test_evaluar_disponibilidad_directamente(self):
         self.assertEqual(evaluar_disponibilidad({}), (False, "formato_desconocido"))
-        self.assertEqual(evaluar_disponibilidad({"completo": "false", "razonNoDisponible": '""'}), (True, None))
-        self.assertEqual(evaluar_disponibilidad({"completo": "true"}), (False, "completo"))
+        self.assertEqual(
+            evaluar_disponibilidad({"completo": "false", "razonNoDisponible": '""', "tarifasDisponibles": "["}),
+            (True, None),
+        )
+        self.assertEqual(evaluar_disponibilidad({"completo": "true", "tarifasDisponibles": "["}), (False, "completo"))
+
+    def test_sin_campo_tarifas_no_es_comprable(self):
+        # `listaTrenes.js` pinta "no disponible para la venta" tanto si
+        # `tarifasDisponibles` es null como si no viene (`== undefined`).
+        self.assertEqual(
+            evaluar_disponibilidad({"completo": "false", "razonNoDisponible": '""'}),
+            (False, "sin_tarifas"),
+        )
 
 
 class TestCamposDelTren(unittest.TestCase):

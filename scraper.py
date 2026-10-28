@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
+from datetime import date, datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -22,7 +24,11 @@ ALLOWED_RESOURCE_TYPES = ["document", "script", "xhr", "fetch"]
 # se ejecuta y el autocompletado devuelve "0 resultados" para cualquier
 # estacion. Bloqueando el dominio entero los scripts se ejecutan tal cual.
 BLOCKED_HOSTS = ("cdn.cookielaw.org",)
-AUTOCOMPLETE_TYPE_DELAY_MS = 60
+
+# Endpoint del sistema de venta "antiguo" al que el buscador de renfe.com hace
+# un POST nativo (ver `_enviar_busqueda`). Tras el POST, venta.renfe.com
+# redirige a `buscarTrenEnlaces.do`, que es quien dispara el DWR.
+SEARCH_ENDPOINT = "https://venta.renfe.com/vol/buscarTren.do?Idioma=es&Pais=ES"
 
 # Espera normal para que la busqueda dispare la peticion DWR.
 DWR_TIMEOUT_S = 30.0
@@ -31,9 +37,6 @@ DWR_TIMEOUT_S = 30.0
 # nuestro turno, y los turnos observados rondan los 1-3 minutos.
 QUEUE_TIMEOUT_S = 420.0
 QUEUE_HOST = "queue-it.net"
-# Margen para que Renfe confirme la estacion elegida (rellena el hidden de
-# forma asincrona tras el click, no en el propio manejador).
-STATION_CONFIRM_TIMEOUT_MS = 5000
 # Margen para que se ejecute el catalogo de estaciones del autocompletado.
 STATION_CATALOG_TIMEOUT_MS = 10000
 
@@ -64,7 +67,11 @@ class RenfeEnColaError(ScraperRenfeError):
 
 
 class EstacionNoConfirmadaError(ScraperRenfeError):
-    """El autocompletado de Renfe no confirmo la estacion seleccionada."""
+    """Ninguna estacion del catalogo de Renfe encaja con el texto buscado."""
+
+
+class FechaSistemaNuevoError(ScraperRenfeError):
+    """La fecha ya solo se vende en el sistema nuevo de Renfe (venta.rsv.renfe.com)."""
 
 
 # Contador de fallos consecutivos de _capture_session_with_playwright. Permite a
@@ -337,7 +344,8 @@ def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]
         la venta; el resto de codigos observados -"3" completo, "4" trayecto
         bloqueado, "5"/"6"/"7" no circula- si la bloquean, igual que cualquier
         codigo nuevo no catalogado (el `else` final de esa misma funcion).
-      - `tarifasDisponibles == null` (sin tarifas no hay nada que comprar).
+      - `tarifasDisponibles` es `null` o no viene (sin tarifas no hay nada que
+        comprar).
       - `soloPlazaH == true` (nivel superior) o `tarifasDisponibles[].soloPlazasH
         == true` en todas las filas de tarifa ofertadas (anidado, ver
         `_tarifa_solo_plaza_reservada`): en el frontend de Renfe esto NO
@@ -365,7 +373,8 @@ def evaluar_disponibilidad(fields: Dict[str, str]) -> Tuple[bool, Optional[str]]
     if _bool_field(fields, "completo"):
         motivos.append("completo")
 
-    if fields.get("tarifasDisponibles") == "null":
+    # Renfe lo trata igual si viene `null` que si no viene (`== undefined`).
+    if fields.get("tarifasDisponibles") in (None, "null"):
         motivos.append("sin_tarifas")
 
     razon = _text_field(fields, "razonNoDisponible")
@@ -542,6 +551,26 @@ def _cookies_only(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return {"cookies": cookies, "origins": []}
 
 
+# Cookies de la sesion de servidor de venta.renfe.com. El DWR `getTrainsList`
+# no lista la ruta de sus parametros, sino la del ultimo `buscarTren.do` de esa
+# sesion: si todas las capturas comparten JSESSIONID, la sesion cacheada de
+# cada ruta acaba devolviendo los trenes de la ultima ruta capturada.
+SERVER_SESSION_COOKIES = ("JSESSIONID", "DWRSESSIONID")
+
+
+def _sin_sesion_servidor(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Copia del storage_state sin la sesion de servidor de Renfe.
+
+    Se conserva todo lo demas -en particular las cookies de Queue-it, que son
+    el motivo de reutilizar el storage_state- para que cada captura abra su
+    propia sesion de venta sin volver a hacer cola.
+    """
+    if not state:
+        return state
+    cookies = [c for c in state.get("cookies") or [] if c.get("name") not in SERVER_SESSION_COOKIES]
+    return {**state, "cookies": cookies}
+
+
 def _load_storage_state_from_disk() -> Optional[Dict[str, Any]]:
     """Carga el storage_state persistido, o None si no hay o esta corrupto."""
     try:
@@ -651,52 +680,144 @@ async def _filtrar_peticion(route) -> None:
         await route.continue_()
 
 
-async def _seleccionar_estacion(page, campo: str, texto: str) -> None:
-    """Escribe `texto` en el autocompletado `campo` y confirma la sugerencia.
+def _plegar(texto: Any) -> str:
+    """Normaliza un nombre de estacion para compararlo: sin tildes, minusculas,
+    y guiones tratados como espacios ("Sevilla Santa Justa" == "SEVILLA-SANTA JUSTA")."""
+    sin_tildes = unicodedata.normalize("NFD", str(texto or ""))
+    sin_tildes = "".join(c for c in sin_tildes if not unicodedata.combining(c))
+    return " ".join(sin_tildes.replace("-", " ").lower().split())
 
-    Hay que CLICAR el `<li>`: Renfe dejo de confirmar la seleccion con
-    ArrowDown+Enter (la sugerencia se queda en `aria-selected="false"`). Sin
-    confirmar, el hidden `cdgoOrigen`/`cdgoDestino` se queda vacio y el boton
-    "Buscar billete" nunca sale de `disabled`, asi que el `click` posterior se
-    quedaba esperando a que se habilitase hasta agotar el timeout: no se
-    llegaba a lanzar ninguna peticion DWR y el bot contestaba "No se han
-    encontrado trenes. Revisa los nombres de las estaciones" para todo.
 
-    Por eso se verifica el hidden despues de clicar: si Renfe vuelve a cambiar
-    el autocompletado, el fallo sale aqui -con nombre- en vez de disfrazarse de
-    busqueda sin resultados medio minuto despues.
+def elegir_estacion(catalogo: List[Dict[str, Any]], texto: str) -> Optional[Dict[str, Any]]:
+    """Elige la estacion del catalogo `estacionesEstatico` que corresponde a `texto`.
+
+    El buscador nuevo de renfe.com (oct. 2026) es un Web Component con Shadow
+    DOM y ya no hay un autocompletado clicable que pilotar; su filtro
+    (`StationDropdownFilter`) es un simple "contiene" sobre el catalogo, en el
+    orden del catalogo, y la sugerencia que se elige es la primera. Se replica
+    aqui, con dos ajustes:
+      1. Antes, coincidencia exacta del nombre o codigo, para que "Cadiz" sea
+         CADIZ y no la primera estacion que lo contenga.
+      2. Despues, el caso inverso: un nombre del catalogo contenido en el
+         texto (el mas largo). Cubre alertas antiguas guardadas con el nombre
+         que devolvia el DWR antes ("Sevilla-San Bernardo", "El Puerto De Santa
+         Maria"), que el catalogo actual llama "SAN BERNARDO" y "PUERTO DE
+         SANTA MARIA": `scheduler.py` las vuelve a buscar con ese texto.
     """
-    selector = f"input#{campo}"
-    opcion = f"#{campo}-awe li[role='option']"
-    hidden = "cdgoOrigen" if campo == "origin" else "cdgoDestino"
+    aguja = _plegar(texto)
+    if not aguja:
+        return None
 
-    await page.click(selector)
-    await page.fill(selector, "")
-    await page.locator(selector).press_sequentially(texto, delay=AUTOCOMPLETE_TYPE_DELAY_MS)
-    await page.wait_for_selector(opcion, state="visible", timeout=5000)
-    await page.locator(opcion).first.click()
+    def _nombres(estacion: Dict[str, Any]) -> List[str]:
+        return [
+            _plegar(estacion.get(campo))
+            for campo in ("desgEstacion", "desgEstacionPlano", "cdgoEstacion")
+            if estacion.get(campo)
+        ]
 
-    # Renfe rellena el hidden ~100-500ms DESPUES del click, no dentro del
-    # manejador: leerlo al vuelo devuelve siempre vacio y daria un falso fallo.
-    leer_hidden = (
-        "(name) => { const el = document.querySelector(`input[name=\"${name}\"]`);"
-        " return el ? el.value : ''; }"
-    )
+    validas = [e for e in catalogo if e.get("clave") and e.get("desgEstacion")]
+
+    for estacion in validas:
+        if aguja in _nombres(estacion):
+            return estacion
+
+    for estacion in validas:
+        if any(aguja in nombre for nombre in _nombres(estacion)):
+            return estacion
+
+    # Solo nombres, no codigos: "SEVIL" esta contenido en "sevilla san bernardo".
+    contenidas = [
+        (len(nombre), estacion)
+        for estacion in validas
+        for nombre in (_plegar(estacion.get("desgEstacion")), _plegar(estacion.get("desgEstacionPlano")))
+        if nombre and nombre in aguja
+    ]
+    if contenidas:
+        return max(contenidas, key=lambda par: par[0])[1]
+
+    return None
+
+
+def _payload_busqueda(origen: Dict[str, Any], destino: Dict[str, Any], date_str: str) -> Dict[str, str]:
+    """Campos del POST a `buscarTren.do`, tal cual los arma el buscador de
+    renfe.com (`RvSearchFormController.#buildFormPayload`) para un adulto,
+    solo ida y sin opciones."""
+    return {
+        "tipoBusqueda": "autocomplete",
+        "currenLocation": "menuBusqueda",
+        "vengoderenfecom": "SI",
+        "desOrigen": origen["desgEstacion"],
+        "desDestino": destino["desgEstacion"],
+        "cdgoOrigen": origen["clave"],
+        "cdgoDestino": destino["clave"],
+        "idiomaBusqueda": "ES",
+        "FechaIdaSel": date_str,
+        "FechaVueltaSel": "",
+        "_fechaIdaVisual": date_str,
+        "_fechaVueltaVisual": "",
+        "minPriceDeparture": "false",
+        "minPriceReturn": "false",
+        "adultos_": "1",
+        "ninos_": "0",
+        "ninosMenores": "0",
+        "codPromocional": "",
+        "plazaH": "false",
+        "sinEnlace": "false",
+        "conMascota": "false",
+        "conBicicleta": "false",
+        "asistencia": "false",
+        "Idioma": "es",
+        "Pais": "ES",
+        "franjaHoraI": "",
+        "franjaHoraV": "",
+    }
+
+
+# Mismo mecanismo que `NativeFormSubmitter` de Renfe: un <form> oculto con
+# POST de navegacion (no fetch), para que venta.renfe.com reciba la busqueda
+# con las cookies y el Referer de www.renfe.com como con un usuario real.
+_ENVIAR_FORMULARIO_JS = """
+([action, campos]) => {
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = action;
+    form.style.display = 'none';
+    for (const [name, value] of Object.entries(campos)) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = name;
+        input.value = value;
+        form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+}
+"""
+
+
+def _es_fecha_sistema_nuevo(date_str: str, umbral: str) -> bool:
+    """True si `date_str` (DD/MM/AAAA) es igual o posterior a `umbral` (AAAA-MM-DD)."""
     try:
-        await page.wait_for_function(
-            f"(name) => {{ const v = ({leer_hidden})(name); return !!v; }}",
-            arg=hidden,
-            timeout=STATION_CONFIRM_TIMEOUT_MS,
-        )
-    except PlaywrightTimeoutError as exc:
-        raise EstacionNoConfirmadaError(
-            f"Renfe no confirmo la estacion {texto!r} en el campo {campo!r}: "
-            f"{hidden} sigue vacio {STATION_CONFIRM_TIMEOUT_MS}ms despues de "
-            f"clicar la sugerencia"
-        ) from exc
+        return datetime.strptime(date_str, "%d/%m/%Y").date() >= date.fromisoformat(umbral)
+    except ValueError:
+        logger.warning("Umbral de coexistencia de Renfe ilegible: %r", umbral)
+        return False
 
-    codigo = await page.evaluate(leer_hidden, hidden)
-    logger.debug("Estacion %s confirmada en %s (%s=%s)", texto, campo, hidden, codigo)
+
+async def _resolver_estacion(page, texto: str) -> Dict[str, Any]:
+    catalogo = await page.evaluate(
+        "() => (window.estacionesEstatico || []).map(e => ({"
+        " clave: e.clave, cdgoEstacion: e.cdgoEstacion,"
+        " desgEstacion: e.desgEstacion, desgEstacionPlano: e.desgEstacionPlano }))"
+    )
+    estacion = elegir_estacion(catalogo, texto)
+    if estacion is None:
+        raise EstacionNoConfirmadaError(
+            f"Ninguna estacion del catalogo de Renfe ({len(catalogo)} estaciones) "
+            f"encaja con {texto!r}"
+        )
+    logger.debug("Estacion %r resuelta como %s (%s)", texto, estacion["desgEstacion"], estacion["clave"])
+    return estacion
 
 
 _COLA_PERSONAS_RE = re.compile(r"(\d+)\s*personas?\s*delante", re.IGNORECASE)
@@ -813,10 +934,11 @@ async def _capture_session_with_playwright(
     # Se reutilizan las cookies de la captura anterior. Ademas de la sesion de
     # Renfe, eso conserva el pase de la cola virtual (Queue-it da ~20 min de
     # ventana): con un contexto nuevo por captura haciamos cola otra vez en
-    # CADA ruta que refresca el scheduler.
+    # CADA ruta que refresca el scheduler. La sesion de servidor, en cambio, NO
+    # se reutiliza: ver `SERVER_SESSION_COOKIES`.
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        storage_state=_storage_state,
+        storage_state=_sin_sesion_servidor(_storage_state),
     )
     page = await context.new_page()
 
@@ -839,129 +961,30 @@ async def _capture_session_with_playwright(
                 "vacio): el autocompletado no podra sugerir ninguna estacion"
             ) from exc
 
-        await _seleccionar_estacion(page, "origin", origin)
-        await _seleccionar_estacion(page, "destination", destination)
-
-        # El radio "solo ida" (label[for='trip-go']) vive dentro del widget de
-        # calendario ("lightpick"), que solo se monta/muestra al abrir el
-        # campo de fecha de ida (#first-input). Intentar clicarlo antes de
-        # abrir el calendario (como se hacia antes) lo deja siempre oculto,
-        # lo que quema el timeout completo de 5s en cada captura antes de
-        # caer al fallback por JS. Abrir el calendario primero lo deja
-        # clicable de verdad y evita ese coste.
-        await page.click("input#first-input")
-        try:
-            await page.wait_for_selector("label[for='trip-go']", state="visible", timeout=3000)
-            await page.click("label[for='trip-go']")
-        except Exception:
-            await page.evaluate(
-                """
-                () => {
-                    const radio = document.querySelector("input#trip-go");
-                    if (!radio) return;
-                    radio.checked = true;
-                    radio.dispatchEvent(new Event('input', { bubbles: true }));
-                    radio.dispatchEvent(new Event('change', { bubbles: true }));
-                    radio.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                }
-                """
+        # Renfe convive con un sistema de venta nuevo (venta.rsv.renfe.com):
+        # su buscador solo manda a buscarTren.do las fechas anteriores a
+        # `data-threshold-date`; para el resto, el DWR antiguo responde con
+        # `listadoTrenes:[]` y el bot lo diria como "no hay trenes".
+        umbral = await page.evaluate(
+            "() => document.querySelector('[data-threshold-date]')?.dataset.thresholdDate || null"
+        )
+        if umbral and _es_fecha_sistema_nuevo(date_str, umbral):
+            raise FechaSistemaNuevoError(
+                f"Renfe vende el {date_str} solo en su sistema nuevo (umbral {umbral}); "
+                f"TrainPicker solo sabe consultar el antiguo"
             )
 
-        fecha_asignada = await page.evaluate(
-                """
-                (value) => {
-                    const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value || '');
-                    if (!m) return { ok: false, reason: 'Formato de fecha inválido' };
-
-                    const dd = m[1]; const mm = m[2]; const yyyy = m[3];
-                    const iso = `${yyyy}-${mm}-${dd}`;
-                    const compact = `${yyyy}${mm}${dd}`;
-
-                    const containsAny = (txt, keys) => keys.some((k) => txt.includes(k));
-
-                    const isDepartureField = (el) => {
-                        const bag = [
-                            el.id || '', el.name || '', el.className || '',
-                            el.getAttribute('aria-label') || '', el.getAttribute('placeholder') || '',
-                            el.getAttribute('title') || '',
-                        ].join(' ').toLowerCase();
-                        const depKeys = ['first-input', 'ida', 'departure', 'salida', 'outbound', 'going', 'dategone'];
-                        const retKeys = ['second-input', 'vuelta', 'return', 'round'];
-                        return containsAny(bag, depKeys) && !containsAny(bag, retKeys);
-                    };
-
-                    const allRoots = [document];
-                    const rootQueue = [document];
-                    while (rootQueue.length) {
-                        const root = rootQueue.shift();
-                        const nodes = Array.from(root.querySelectorAll('*'));
-                        for (const node of nodes) {
-                            if (node.shadowRoot) {
-                                allRoots.push(node.shadowRoot);
-                                rootQueue.push(node.shadowRoot);
-                            }
-                        }
-                    }
-
-                    const candidates = [];
-                    for (const root of allRoots) {
-                        const inputs = Array.from(root.querySelectorAll('input'));
-                        for (const input of inputs) {
-                            if (isDepartureField(input)) candidates.push(input);
-                        }
-                    }
-
-                    let updated = 0;
-                    for (const input of candidates) {
-                        try {
-                            const type = (input.type || '').toLowerCase();
-                            const useIso = type === 'date';
-                            const nextValue = useIso ? iso : value;
-
-                            input.removeAttribute('readonly');
-                            input.value = nextValue;
-                            input.setAttribute('value', nextValue);
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
-                            input.dispatchEvent(new Event('blur', { bubbles: true }));
-                            updated += 1;
-                        } catch (_) {}
-                    }
-
-                    for (const root of allRoots) {
-                        const hiddenInputs = Array.from(root.querySelectorAll('input[type="hidden"]'));
-                        for (const hidden of hiddenInputs) {
-                            if (!isDepartureField(hidden)) continue;
-                            const typeHint = `${hidden.id || ''} ${hidden.name || ''}`.toLowerCase();
-                            if (typeHint.includes('iso') || typeHint.includes('yyyy')) {
-                                hidden.value = iso;
-                            } else if (typeHint.includes('compact') || typeHint.includes('yyyymmdd')) {
-                                hidden.value = compact;
-                            } else {
-                                hidden.value = value;
-                            }
-                            hidden.setAttribute('value', hidden.value);
-                            hidden.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-
-                    return { ok: updated > 0, updated };
-                }
-                """,
-                date_str,
-            )
-
-        if not fecha_asignada.get("ok"):
-            raise Exception("No se pudo aplicar la fecha de ida en el formulario")
+        estacion_origen = await _resolver_estacion(page, origin)
+        estacion_destino = await _resolver_estacion(page, destination)
 
         logger.info("Interceptando solicitud DWR de trenes")
         url_keyword = "getTrainsList.dwr"
 
         async def _lanzar_busqueda() -> None:
-            search_button = "button[title='Buscar billete']"
-            await page.wait_for_selector(search_button, state="visible", timeout=10000)
-            await page.click(search_button)
+            await page.evaluate(
+                _ENVIAR_FORMULARIO_JS,
+                [SEARCH_ENDPOINT, _payload_busqueda(estacion_origen, estacion_destino, date_str)],
+            )
 
         api_response = await _esperar_respuesta_dwr(
             page, url_keyword, _lanzar_busqueda, on_queue=on_queue
@@ -981,6 +1004,10 @@ async def _capture_session_with_playwright(
         _consecutive_capture_failures = 0
 
         return parsear_dwr_renfe(texto_dwr, date_str)
+
+    except FechaSistemaNuevoError:
+        # No es una rotura del scraper: no cuenta para la alerta al admin.
+        raise
 
     except Exception as e:
         _consecutive_capture_failures += 1
