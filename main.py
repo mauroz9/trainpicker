@@ -16,7 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 
-from scraper import RenfeEnColaError, get_trains
+from scraper import EstacionNoConfirmadaError, FechaSistemaNuevoError, RenfeEnColaError, get_trains
 from database import add_alert, delete_alert, init_db, get_user_alerts
 from log_config import configurar_logging
 
@@ -186,6 +186,22 @@ async def recibir_fecha_y_buscar(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             "⏳ *Renfe tiene ahora mismo cola de acceso* a su web y no nos ha dado turno a tiempo.\n\n"
             "No es culpa de tu búsqueda. Vuelve a intentarlo en unos minutos.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    except EstacionNoConfirmadaError as e:
+        logger.warning("Estación no encontrada en el catálogo de Renfe: %s", e)
+        await update.message.reply_text(
+            "❌ *No encuentro alguna de las estaciones* en el catálogo de Renfe.\n\n"
+            "Revisa los nombres (ej: 'Madrid' o 'Sevilla') y escribe /buscar para volver a empezar.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    except FechaSistemaNuevoError as e:
+        logger.warning("Fecha solo disponible en el sistema nuevo de Renfe: %s", e)
+        await update.message.reply_text(
+            "❌ *Renfe vende esa fecha en su nuevo sistema de venta*, que TrainPicker "
+            "todavía no sabe consultar.\n\nPrueba con una fecha anterior.",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
